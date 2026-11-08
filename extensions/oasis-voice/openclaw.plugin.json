@@ -1,0 +1,52 @@
+{
+  "id": "oasis-voice",
+  "name": "Oasis Voice",
+  "description": "TTS and streaming STT via oasis-voice sidecar (Piper TTS + Moonshine STT on the lite tier; GPU tiers available on the hosted endpoint).",
+  "enabledByDefault": true,
+  "activation": {
+    "onStartup": true
+  },
+  "contracts": {
+    "speechProviders": [
+      "oasis-voice"
+    ],
+    "mediaUnderstandingProviders": [
+      "oasis-voice"
+    ],
+    "realtimeTranscriptionProviders": [
+      "oasis-voice"
+    ]
+  },
+  "_contracts_NOTE_2026_10_15": "REVERSES the 2026-05-16 note (openclaw 2026.4.26), which kept this plugin contracts-less so it would eager-load. On openclaw 2026.7.1 the gateway loads at startup ONLY plugins with activation.onStartup (src/plugins/gateway-startup-plugin-ids.ts shouldConsiderForGatewayStartup), and capability resolution maps a requested provider to its plugin through manifest contracts (src/plugins/capability-provider-runtime.ts). Contracts-less, oasis-voice loaded on some boots and not others; on one bot's 2026-10-15 boot it never loaded and every Telegram voice note failed with 'Media provider not available: oasis-voice'. oasis-semantics recorded the same reversal on 2026-07-11 (contracts make a plugin EAGER on newer openclaw). Keep tools.media.audio.models and messages.tts.provider pinned in the entrypoint as before.",
+  "mediaUnderstandingProviderMetadata": {
+    "oasis-voice": {
+      "capabilities": [
+        "audio"
+      ],
+      "defaultModels": {
+        "audio": "moonshine-base"
+      },
+      "autoPriority": {
+        "audio": 10
+      }
+    }
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "endpoint": {
+        "type": "string",
+        "description": "Base URL of the oasis-voice HTTP server. Default: http://127.0.0.1:8731"
+      },
+      "tts_voice": {
+        "type": "string",
+        "description": "TTS voice passed to oasis-voice (e.g. piper:en_GB-aru-medium, piper:en_GB-vctk-medium#p236). Default: piper:en_GB-aru-medium"
+      },
+      "bearer_token": {
+        "type": "string",
+        "description": "Optional Bearer token for hosted/cloud oasis-voice endpoint (CLAW-013+). Not needed for local lite tier."
+      }
+    }
+  }
+}

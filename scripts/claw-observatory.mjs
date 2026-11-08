@@ -1,0 +1,4536 @@
+#!/usr/bin/env node
+// ── claw-observatory (CLAW-108) ──────────────────────────────────────────────
+// One place to watch the fleet at three levels, without typing docker commands.
+//
+//   System 2  slow, high level   what work is on the .swarm boards
+//   System 1  fast, low level    follow one agent or subagent session live:
+//                                messages, thinking, tool calls, tool results
+//   System 3  outer level        who each agent is: identity, soul, memory,
+//                                dreams, age, reviewer record, mail contacts,
+//                                and how those change night to night
+//
+// COMMANDS
+//   list [--json]                      every bot: state, Control UI address, board
+//   open <bot>|observatory|board       open an address in the default browser
+//   serve [--port N] [--open] [--no-dashboard]
+//                                      serve the observatory page on 127.0.0.1
+//                                      (a stable address: bookmark it), and
+//                                      start the dot_swarm dashboard beside it
+//   snapshot [--dir PATH] [--no-commit]
+//                                      copy each bot's self files into the
+//                                      history repository and commit
+//   pair <bot> [--approve REQUEST_ID]  list, or approve, a pending Control UI
+//                                      device pairing
+//   proxy-key                          create the port proxy access key if missing
+//   feedback list|show|pull|set        the change requests written on the page
+//                                      (see claw-observatory-feedback.mjs)
+//
+// TRUST MODEL — read before changing how data is read or served
+//   1. The operator, 2026-08-10: agents must NOT be able to search other agents'
+//      memories and transcripts. This tool reads all of them, so no bot may
+//      reach it. It runs on the Mac, binds 127.0.0.1, and reads bot files with
+//      `docker exec` over the Docker socket. It never runs as a container on a
+//      bot network. The API also requires a per-run token and a loopback Host
+//      header: Docker Desktop forwards host.docker.internal to the Mac's
+//      loopback for any container that has a route out (Orion, Sample Bot).
+//   2. Everything a bot wrote is untrusted text. The page renders it with
+//      textContent only, under a CSP that allows no inline script.
+//   3. The collectors only read. They lstat first and skip anything that is
+//      not a regular file.
+//   4. The snapshot never copies identity/device.json (the device private
+//      key), openclaw.json, tokens, or transcripts.
+//   5. The only writes the API takes are change requests (/api/feedback),
+//      the Control UI open and approve (item 7), the settings (item 8), and
+//      the decisions and cron changes (item 9), and .swarm item comments
+//      and edits (item 10), and fleet start/restart (item 11), and the
+//      Studio writes and drafts (item 12), and the authority actions
+//      (item 14), and the access edits (item 15).
+//      A write needs the token AND this page's Origin. The requests and their screenshots stay in the
+//      state folder, which no bot mounts: a screenshot can show any agent's
+//      memory.
+//   7. Control UI (operator, 2026-10-07, R2): on the operator's click, POST
+//      /api/control-ui/<bot>/open reads that bot's gateway token and returns
+//      it to this page in a URL fragment only, as `openclaw dashboard` does.
+//      This server keeps no copy and never logs it. The approve route pairs
+//      only a Control UI browser, never from the container's loopback, and
+//      only for a few minutes after that open (judgeControlUiRequest).
+//   8. Settings (operator, 2026-10-08): PUT /api/user-md/<bot> replaces that
+//      bot's workspace/USER.md, which openclaw puts in every prompt of that
+//      bot. Only this page can send it (token + Origin, as item 5). The
+//      container refuses the write when the file changed since the page read
+//      it, never follows a symlink, and the server keeps the replaced text
+//      in the state folder. PUT /api/settings keeps the user profile and the
+//      swarm parameters there too. Nothing here reads or writes any other
+//      bot file.
+//   9. Decisions and cron (operator, 2026-10-25: "browse and modify cron jobs,
+//      standing directives, and open permissions asks"). POST
+//      /api/approvals/decide writes one decision file into a folder that only
+//      the Mac and the autoreviewer container mount; the autoreviewer stays the
+//      only ledger writer and edits the Telegram card, so the Telegram card and
+//      this page are two doors to one decision. POST /api/cron/<bot>/<id> runs
+//      the bot's own `openclaw cron edit|run|rm` over `docker exec`, with argv
+//      only (no shell), checked values, and an openclaw.json fingerprint
+//      before and after. Both need the token AND this page's Origin (item 5).
+//      Bots still cannot reach either: they have no token, and no bot mounts
+//      the decision folder.
+//  10. .swarm items (operator, 2026-10-25). POST /api/boards/<bot>/items/<ID>
+//      adds a comment (to the dot_swarm thread file and as a line in the
+//      item's queue.md block, which the bots read) or replaces one item's
+//      title and body when its block hash still matches. Only a bot board
+//      that fleet discovery found is writable; token + Origin as item 5.
+//  11. Fleet health (operator, 2026-10-26). POST /api/fleet/containers/<name>/
+//      start|restart and POST /api/fleet/recover run `docker start` or
+//      `docker restart` on fleet containers only (the bot prefix and
+//      FLEET_SERVICES, minus the exclude pattern); argv only; token + Origin.
+//      No recreate: a container keeps the config it had.
+//  12. Studio (operator, 2026-10-30: "the correct content is loaded and settable
+//      for each agent's Control UI" and "built-in AI ... to make edits to
+//      avatars, themes"). PUT /api/studio/<bot>/identity replaces only the
+//      identity field lines of workspace/IDENTITY.md (hash check, no symlink,
+//      the replaced text kept in the state folder, as item 8). PUT .../avatar
+//      writes ONE new image file into workspace/avatars/ (a sniffed PNG, JPEG
+//      or WebP, 4 MB at most, never over an existing file), and both avatar
+//      routes then run the bot's own `openclaw agents set-identity --avatar`
+//      (argv only), so the Control UI shows the picture. PUT .../theme keeps
+//      a hex-only palette in the state folder; the Control UI open carries it
+//      (and the Appearance mode) in the URL fragment to the port proxy's
+//      unlock page, which stores it in that Control UI's own settings. POST
+//      .../draft asks oasis-generation with the observatory's own key (a file
+//      in the state folder) and returns a checked draft; it writes nothing.
+//      A model reply and a bot's words are untrusted: an SVG draft is shown
+//      only as an image and saved only as the PNG the page draws from it.
+//      Token + Origin on every write, as item 5.
+//  13. Access (operator, 2026-11-02). GET /api/access shows each bot's level,
+//      exec, reviewer, decider and sandbox settings, tools, mounts and drift
+//      (claw-observatory-access.mjs). It only reads; the edits are item 15.
+//      From `docker inspect` it reads the mounts and ONLY the environment
+//      names in ACCESS_ENV: the rest of a bot's environment holds tokens, and
+//      none of it reaches the page. In the bot it reads a few keys of
+//      openclaw.json and exec-approvals.json, the persona lock dates, and
+//      role.yaml through the image's own python3 + PyYAML (argv only).
+//  14. Authority (operator, 2026-11-03). GET /api/authority shows the signed
+//      authority log of scripts/claw-authority.mjs: per bot the level in
+//      force, the reviewer chain and its health, the home hub, the grants and
+//      the bot's copy of the view; the hub's cards; and the signed history
+//      (claw-observatory-authority.mjs). POST /api/authority/restrict|lift|keep
+//      appends ONE restrictions event that the operator's root key signs: the key is
+//      in the Secure Enclave, so each one asks for Touch ID on the Mac, with
+//      a text that the tool builds from the event. The page only asks; Touch
+//      ID is the confirmation outside the page. One signature at a time.
+//      Token + Origin, as item 5. This server never writes a bot view: the
+//      authority daemon stays the only writer. In a bot it reads only counts
+//      and times from the reviewer audit, and from `docker inspect` only
+//      the ACCESS_ENV names and the mounts.
+//  15. Access edits (operator, 2026-11-06; step 5 part 1). POST /api/access/
+//      <bot>/edit adds or removes ONE tool in the bot's role.yaml
+//      (tools.alsoAllow) or ONE reviewer write root (bots/reviewer-policy.
+//      local.json, then the merged bots/.runtime/reviewer-policy.json), in
+//      claw-observatory-access-edit.mjs. Before a file changes, the edit is
+//      an event in the authority log's access stream: an add (a widening)
+//      needs the operator's root key, so Touch ID; a remove (a tightening) is signed
+//      by the hub key. The server enforces the rules (no widening for a
+//      Level C bot, a write root under /reach/ and off the fleet's plumbing,
+//      never the last write root), compares the file hash with the one the
+//      page showed, follows no symlink, writes the two mounted files in
+//      place, and keeps the replaced text in the state folder. Nothing
+//      restarts here: the restart is item 11's route. Token + Origin.
+//   6. `serve` also starts the dot_swarm dashboard (`swarm gui`, 18781), where
+//      the human claims, finishes, blocks and comments on items. A bot can
+//      reach that port too, so the observatory starts it only after it proves
+//      the fixed behavior (dot_swarm 2026-09-28): the page carries no token,
+//      and a read without the token is refused. An older dot_swarm is not
+//      started. The dashboard token is fresh for each run and reaches the
+//      browser only in a URL fragment, from this token-gated API.
+//
+// DEPLOYMENT NOTE: `make observatory-snapshot-install` copies THIS FILE ALONE
+// to ~/Library/Application Support/oasis-x/ for launchd (TCC blocks launchd
+// from exec-ing anything inside ~/Documents). Keep the module free of static
+// local imports. The page assets and claw-observatory-feedback.mjs are loaded
+// only by `serve` and `feedback`, from the repo copy.
+
+import { execFile, spawn } from "node:child_process";
+import crypto from "node:crypto";
+import fs from "node:fs";
+import http from "node:http";
+import os from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import zlib from "node:zlib";
+// The launchd copies run this file alone, so the helper is optional here.
+// A copy alone uses the generic text.
+let operatorName = () => "the operator";
+try {
+  ({ operatorName } = await import("./lib/operator-name.mjs"));
+} catch {
+  // The helper is not beside this copy.
+}
+
+const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
+const HOME = os.homedir();
+
+export const BOT_HOME = "/home/node/.openclaw";
+export const GATEWAY_PORT = 18789;
+const CONTAINER_PREFIX = "oasis-claw-";
+const PROXY_CONTAINER = "oasis-observatory-proxy";
+const DEFAULT_PORT = 18780;
+const SWARM_PORT = 18781;
+const STATE_DIR =
+  process.env.OASIS_OBSERVATORY_STATE_DIR ||
+  path.join(HOME, "Library", "Application Support", "oasis-x", "observatory");
+const SERVE_FILE = path.join(STATE_DIR, "serve.json");
+export const PROXY_KEY_FILE = path.join(STATE_DIR, "proxy-key");
+// The observatory's own access key. Stable across restarts, so a bookmark to
+// http://127.0.0.1:18780/ keeps working (see createObservatoryServer).
+export const OBSERVATORY_KEY_FILE = path.join(STATE_DIR, "observatory-key");
+const IDENTITY_DIR = path.join(STATE_DIR, "identities");
+export const DEFAULT_SNAPSHOT_DIR = path.join(STATE_DIR, "snapshots");
+export const DEFAULT_FEEDBACK_DIR = path.join(STATE_DIR, "feedback");
+const DEFAULT_PULL_DIR = path.join(SCRIPT_DIR, "..", ".swarm", "feedback");
+// Loaded only when needed; see the DEPLOYMENT NOTE above.
+const FEEDBACK_MODULE = new URL("./claw-observatory-feedback.mjs", import.meta.url);
+const MAIL_ROOT = process.env.OASIS_CLAW_MAIL_ROOT || path.join(HOME, "Documents", "Runes", ".claw-mail");
+// Containers the observatory never shows, reads, or stores. The pattern comes
+// from OASIS_OBSERVATORY_EXCLUDE, else from the file `exclude` in the state
+// folder (one pattern per line, `#` starts a comment), else nothing is
+// excluded. Which deployments to hide is private to the host, so the public
+// default names none.
+export function excludePattern(env = process.env, stateDir = STATE_DIR) {
+  let src = String(env.OASIS_OBSERVATORY_EXCLUDE || "").trim();
+  if (!src) {
+    try {
+      src = fs
+        .readFileSync(path.join(stateDir, "exclude"), "utf8")
+        .split("\n")
+        .map((l) => l.trim())
+        .filter((l) => l && !l.startsWith("#"))
+        .join("|");
+    } catch {
+      src = "";
+    }
+  }
+  return src ? new RegExp(src, "i") : null;
+}
+const EXCLUDE_RE = excludePattern();
+const ASSET_DIR = path.join(SCRIPT_DIR, "observatory");
+const ASSETS = {
+  "/": ["index.html", "text/html; charset=utf-8"],
+  "/index.html": ["index.html", "text/html; charset=utf-8"],
+  "/app.js": ["app.js", "text/javascript; charset=utf-8"],
+  "/app.css": ["app.css", "text/css; charset=utf-8"],
+  "/swarm.js": ["swarm.js", "text/javascript; charset=utf-8"],
+  "/theme.js": ["theme.js", "text/javascript; charset=utf-8"],
+};
+
+// ── process helpers ──────────────────────────────────────────────────────────
+
+function run(cmd, args, { timeoutMs = 30_000, cwd, input } = {}) {
+  return new Promise((resolve, reject) => {
+    const child = execFile(
+      cmd,
+      args,
+      { cwd, timeout: timeoutMs, maxBuffer: 128 * 1024 * 1024, encoding: "utf8" },
+      (err, stdout, stderr) => {
+        if (err) {
+          // err.message repeats the whole argv, which for `node -e` is the
+          // collector source. Report stderr instead.
+          const detail = String(stderr || "").trim().split("\n").slice(-3).join(" | ");
+          const reason = detail || (err.killed ? "timed out" : `exit ${err.code ?? "?"}`);
+          reject(new Error(`${cmd} ${args[0] ?? ""} failed: ${reason}`));
+          return;
+        }
+        resolve(stdout);
+      },
+    );
+    // `input` goes to stdin: for data larger than one argument may be (Linux
+    // allows 128 KB), such as an avatar image for `docker exec -i`.
+    if (input !== undefined) child.stdin.end(input);
+  });
+}
+
+const docker = (args, opts) => run("docker", args, opts);
+
+function git(dir, args, opts) {
+  return run(
+    "git",
+    ["-C", dir, "-c", "core.quotepath=off", "-c", "commit.gpgsign=false", ...args],
+    opts,
+  );
+}
+
+/** Source for `node -e` inside a bot container. The collector must be
+ *  self-contained: it is stringified, so it can use only its parameters and
+ *  language built-ins. */
+export function collectorScript(fn, home = BOT_HOME) {
+  return (
+    `"use strict";` +
+    `const __r=(${fn.toString()})(require("fs"),require("path"),${JSON.stringify(home)},...process.argv.slice(1));` +
+    `process.stdout.write(JSON.stringify(__r));`
+  );
+}
+
+async function collect(container, fn, args = [], opts = {}) {
+  const out = await docker(["exec", container, "node", "-e", collectorScript(fn), ...args.map(String)], {
+    timeoutMs: 60_000,
+    ...opts,
+  });
+  return JSON.parse(out);
+}
+
+// ── fleet discovery ──────────────────────────────────────────────────────────
+
+export function sanitizeKey(raw) {
+  return String(raw ?? "")
+    .toLowerCase()
+    .replace(/[^a-z0-9-]/g, "")
+    .slice(0, 40);
+}
+
+export function envMap(inspect) {
+  const env = new Map();
+  for (const entry of inspect?.Config?.Env ?? []) {
+    const i = entry.indexOf("=");
+    if (i > 0) {
+      env.set(entry.slice(0, i), entry.slice(i + 1));
+    }
+  }
+  return env;
+}
+
+/** Map a path inside a container to the host path of the bind mount that
+ *  serves it (longest matching destination wins, so a nested shield mount
+ *  shadows its parent the same way it does inside the container). */
+export function hostPathFor(mounts, containerPath) {
+  let best = null;
+  for (const mount of mounts ?? []) {
+    if (mount.Type !== "bind") {
+      continue;
+    }
+    const dest = String(mount.Destination).replace(/\/+$/, "");
+    if (containerPath === dest || containerPath.startsWith(`${dest}/`)) {
+      if (!best || dest.length > best.dest.length) {
+        best = { dest, source: String(mount.Source) };
+      }
+    }
+  }
+  if (!best) {
+    return null;
+  }
+  return best.source.replace(/^\/host_mnt(?=\/)/, "") + containerPath.slice(best.dest.length);
+}
+
+export function publishedPort(inspect, containerPort) {
+  const bindings = inspect?.NetworkSettings?.Ports?.[`${containerPort}/tcp`] ?? [];
+  const hit = bindings.find((b) => b && /^(127\.0\.0\.1|0\.0\.0\.0|::|)$/.test(b.HostIp ?? ""));
+  return hit ? Number(hit.HostPort) : null;
+}
+
+/** The host port that compose declared for a container port, whether or not
+ *  Docker published it (it does not publish for an internal-only network). */
+export function declaredPort(inspect, containerPort) {
+  const bindings = inspect?.HostConfig?.PortBindings?.[`${containerPort}/tcp`] ?? [];
+  const hit = bindings.find((b) => b && /^(127\.0\.0\.1|0\.0\.0\.0|::|)$/.test(b.HostIp ?? "") && b.HostPort);
+  return hit ? Number(hit.HostPort) : null;
+}
+
+// ── roles: the color of each bot on the page ────────────────────────────────
+// A bot's color shows the job it was deployed for: the `role:` line of
+// bots/<name>/role.yaml (mounted at /app/role.yaml). Families, not bots, get
+// colors, so two bots with the same kind of job share one; the avatar tells
+// them apart. The first family whose pattern matches wins. A bot without a
+// role.yaml (Orion) is matched on the Creature line of its IDENTITY.md.
+// The colors themselves are in scripts/observatory/app.css (.fam-<id>).
+export const ROLE_FAMILIES = [
+  { id: "security", label: "Security", re: /secur|defen[cs]e|threat|vuln|red-?team/ },
+  { id: "markets", label: "Markets and trading", re: /market|trading|financ|invest|pricing/ },
+  { id: "research", label: "Research", re: /research|alignment|science|model|analysis|cartograph/ },
+  { id: "hardware", label: "Hardware and shop", re: /hardware|firmware|sourcing|shop|fabricat|manufactur/ },
+  // Before systems and operations: Orion's Creature line ("Personal digital
+  // assistant … a bit of a cloud-brain") would otherwise match "cloud".
+  { id: "assistant", label: "Personal assistant", re: /assistant|personal|concierge|secretary/ },
+  { id: "systems", label: "Systems and governance", re: /systems|governance|fleet/ },
+  { id: "operations", label: "Operations and admin", re: /operations|\bops\b|admin|cloud|infra/ },
+];
+export const OTHER_FAMILY = { id: "other", label: "Other" };
+
+export function roleFamily(...texts) {
+  for (const text of texts) {
+    const t = String(text ?? "").toLowerCase();
+    if (!t) continue;
+    const family = ROLE_FAMILIES.find((f) => f.re.test(t));
+    if (family) return family.id;
+  }
+  return OTHER_FAMILY.id;
+}
+
+export function parseRoleYaml(text) {
+  const m = String(text ?? "").match(/^role:\s*([A-Za-z0-9][A-Za-z0-9_.-]{0,79})\s*(?:#.*)?$/m);
+  return m ? m[1] : null;
+}
+
+function readRoleFile(file) {
+  try {
+    const st = fs.statSync(file);
+    if (!st.isFile() || st.size > 512 * 1024) return null;
+    return parseRoleYaml(fs.readFileSync(file, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+export function parseProxyRoutes(spec) {
+  const routes = [];
+  for (const part of String(spec ?? "").split(",")) {
+    const m = part.trim().match(/^(\d+)=([^:=\s]+):(\d+)$/);
+    if (m) {
+      routes.push({ listenPort: Number(m[1]), targetHost: m[2], targetPort: Number(m[3]) });
+    }
+  }
+  return routes;
+}
+
+// ── port proxy routes, generated from the fleet ──────────────────────────────
+// `make observatory-proxy-up` (bots/Makefile) writes these into a compose
+// override, so a new bot gets a Control UI address without a hand edit.
+// One route per bot: listen port = the bot's declared gateway port + 100.
+//   - on the sandboxed network: the proxy (also on it) reaches the container;
+//   - published on the Mac (Sample Bot): through host.docker.internal;
+//   - host port 18789 (Orion): no route, the browser opens it directly.
+export const SANDBOXED_NETWORK = "oasis-claw_oasis_sandboxed";
+const RESERVED_PORTS = new Set([DEFAULT_PORT, SWARM_PORT, GATEWAY_PORT]);
+
+export function planProxyRoutes(bots) {
+  const routes = [];
+  const skipped = [];
+  const taken = new Set([...RESERVED_PORTS, ...bots.map((b) => b.declaredPort).filter(Boolean)]);
+  for (const b of bots) {
+    if (b.excluded) {
+      skipped.push({ key: b.key, reason: "excluded (OASIS_OBSERVATORY_EXCLUDE)" });
+      continue;
+    }
+    if (!b.declaredPort) {
+      skipped.push({ key: b.key, reason: "no host port declared for 18789" });
+      continue;
+    }
+    if (b.declaredPort === GATEWAY_PORT) continue;
+    const listenPort = b.declaredPort + 100;
+    let target = null;
+    if ((b.networks ?? []).includes(SANDBOXED_NETWORK)) target = `${b.container}:${GATEWAY_PORT}`;
+    else if (b.hostPort) target = `host.docker.internal:${b.hostPort}`;
+    if (!target) {
+      skipped.push({ key: b.key, reason: "neither on the sandboxed network nor published" });
+      continue;
+    }
+    if (taken.has(listenPort) || routes.some((r) => r.listenPort === listenPort)) {
+      skipped.push({ key: b.key, reason: `port ${listenPort} is already in use` });
+      continue;
+    }
+    routes.push({ key: b.key, listenPort, target });
+  }
+  routes.sort((a, b) => a.listenPort - b.listenPort);
+  return { routes, skipped };
+}
+
+export function renderProxyRoutesOverride({ routes, skipped }) {
+  const lines = [
+    "# GENERATED by `claw-observatory.mjs proxy-routes` (bots/Makefile: observatory-proxy-up).",
+    "# Do not edit: the next `make observatory-proxy-up` rewrites it from the fleet.",
+    ...skipped.map((s) => `# no route for ${s.key}: ${s.reason}`),
+    "services:",
+    "  port-proxy:",
+    "    environment:",
+    // ", " keeps the value identical to the hand-written list it replaced,
+    // so the first generated run does not recreate the proxy.
+    `      ROUTES: ${JSON.stringify(routes.map((r) => `${r.listenPort}=${r.target}`).join(", "))}`,
+    "    ports:",
+    ...routes.map((r) => `      - "127.0.0.1:${r.listenPort}:${r.listenPort}"`),
+    "",
+  ];
+  return lines.join("\n");
+}
+
+/** Where a browser can open this bot's Control UI. The gateway allows only the
+ *  container-port origin, so a direct publish works only on host port 18789;
+ *  any other bot needs the observatory port proxy (scripts/claw-port-proxy.mjs). */
+export function controlUiFor({ container, hostPort }, routes) {
+  if (hostPort === GATEWAY_PORT) {
+    return { url: `http://127.0.0.1:${GATEWAY_PORT}/`, via: "direct" };
+  }
+  const route = routes.find(
+    (r) =>
+      r.targetHost === container ||
+      (hostPort != null && r.targetHost === "host.docker.internal" && r.targetPort === hostPort),
+  );
+  if (route) {
+    return { url: `http://127.0.0.1:${route.hostPort}/`, via: "proxy" };
+  }
+  return { url: null, via: hostPort != null ? "origin-mismatch" : "unpublished" };
+}
+
+/** A random access key kept in `file`. Created on first use with mode 600 in
+ *  the observatory state directory, which no bot mounts. Used for the port
+ *  proxy (scripts/claw-port-proxy.mjs explains why it is locked) and for the
+ *  observatory itself. */
+export function ensureProxyKey(file = PROXY_KEY_FILE) {
+  return ensureKey(file);
+}
+
+/** Replace the key in `file`. Every browser must unlock again. */
+export function rotateKey(file) {
+  fs.rmSync(file, { force: true });
+  return ensureKey(file);
+}
+
+export function ensureKey(file) {
+  try {
+    const existing = fs.readFileSync(file, "utf8").trim();
+    if (/^[A-Za-z0-9_-]{32,256}$/.test(existing)) {
+      return existing;
+    }
+  } catch {
+    // no key yet
+  }
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  const key = crypto.randomBytes(32).toString("base64url");
+  fs.writeFileSync(file, `${key}\n`, { mode: 0o600 });
+  return key;
+}
+
+/** Add `controlUi.openUrl`: the address a browser should open. A proxied UI
+ *  goes through the proxy's unlock page first, which reads the key from the
+ *  URL fragment (never sent to a server) and sets the access cookie. */
+export function withOpenUrls(fleet, key) {
+  return {
+    ...fleet,
+    bots: fleet.bots.map((b) => ({
+      ...b,
+      controlUi: {
+        ...b.controlUi,
+        openUrl: b.controlUi.via === "proxy" && key ? `${b.controlUi.url}__claw-proxy/unlock#k=${key}` : b.controlUi.url,
+      },
+    })),
+  };
+}
+
+// ── one-click Control UI (operator, 2026-10-07, R2) ──────────────────────────────
+// A Control UI shows the chat only after three steps: the port proxy cookie
+// (sandboxed bots), the bot's gateway token, and a paired browser device.
+// Without the token the gateway closes the socket as unauthorized, and the UI
+// reports only "Could not connect". So the page asks this server for a
+// signed-in address (POST .../open), and then pairs the browser it opened
+// (POST .../approve).
+
+export const CONTROL_UI_CLIENT = "openclaw-control-ui";
+const GATEWAY_TOKEN_RE = /^[A-Za-z0-9_-]{16,256}$/;
+const REQUEST_ID_RE = /^[A-Za-z0-9_-]{4,128}$/;
+/** How long after an open the observatory accepts a pairing for that bot. */
+export const PAIRING_WINDOW_MS = 3 * 60 * 1000;
+
+/** Collector: the gateway token the gateway checks. openclaw.json holds a file
+ *  SecretRef to `.gateway-token` (VH-002), so the token is read from that file;
+ *  a literal string in openclaw.json is still honoured for a bot on an older
+ *  image. Only the open route calls this collector; the snapshot and every
+ *  other route never do. */
+export function collectGatewayToken(fs, path, home) {
+  let auth;
+  try {
+    auth = (JSON.parse(fs.readFileSync(path.join(home, "openclaw.json"), "utf8")).gateway || {}).auth || {};
+  } catch {
+    return { mode: null, token: null };
+  }
+  if (typeof auth.token === "string") return { mode: auth.mode || null, token: auth.token };
+  try {
+    const token = fs.readFileSync(path.join(home, ".gateway-token"), "utf8").trim();
+    return { mode: auth.mode || null, token: token || null };
+  } catch {
+    return { mode: auth.mode || null, token: null };
+  }
+}
+
+/** The address that opens `bot`'s Control UI signed in. The key and the token
+ *  are in the fragment, which a browser never sends to a server.
+ *  Through the port proxy the fragment also carries the look (2026-10-30):
+ *  `m=` the Appearance mode and `ct=` the bot's Studio theme (base64url JSON).
+ *  The proxy's unlock page, on the Control UI's own origin, puts both into the
+ *  Control UI's stored settings. A Control UI that the Mac publishes directly
+ *  (Orion) has no page of ours on its origin, so it keeps its own setting. */
+export function controlUiSignedInUrl(bot, { proxyKey, gatewayToken, mode, theme }) {
+  const base = bot?.controlUi?.url;
+  if (!base) return null;
+  if (!GATEWAY_TOKEN_RE.test(String(gatewayToken ?? ""))) throw new Error(`${bot.key}: no usable gateway token`);
+  if (bot.controlUi.via === "proxy") {
+    if (!proxyKey) return null;
+    let look = APPEARANCE_MODES.has(mode) ? `&m=${mode}` : "";
+    if (theme && /^[A-Za-z0-9_-]{16,24000}$/.test(theme)) look += `&ct=${theme}`;
+    return `${base}__claw-proxy/unlock#k=${proxyKey}&token=${gatewayToken}${look}`;
+  }
+  return `${base}chat?session=main#token=${gatewayToken}`;
+}
+
+/** May the observatory approve this pending pairing request? Only a Control UI
+ *  browser: a bot's own CLI or gateway client asking for more scopes is a
+ *  privilege grant that the operator makes by hand (`make pair`). Never a client on the
+ *  container's loopback, because the bot itself holds its own token. Only
+ *  within PAIRING_WINDOW_MS after the operator opened the UI from this page (`armedAt`).
+ *  `viaProxy` marks a request that came through the port proxy, which a
+ *  browser reaches only with the access key; the page approves those without
+ *  a second click. */
+export function judgeControlUiRequest(request, { proxyAddresses = [], armedAt = null, now = Date.now() } = {}) {
+  if (request?.clientId !== CONTROL_UI_CLIENT) return { ok: false, reason: "not a Control UI browser" };
+  const ip = String(request.remoteIp ?? "").replace(/^::ffff:/, "");
+  if (!ip || ip === "::1" || ip.startsWith("127.")) return { ok: false, reason: "made inside the bot's container" };
+  if (armedAt == null || now - armedAt > PAIRING_WINDOW_MS) {
+    return { ok: false, reason: "open the Control UI from the observatory first" };
+  }
+  return { ok: true, viaProxy: proxyAddresses.includes(ip) };
+}
+
+async function listDevices(container) {
+  const raw = await docker(["exec", container, "openclaw", "devices", "list", "--json"], { timeoutMs: 30_000 });
+  const data = JSON.parse(raw.slice(raw.indexOf("{")));
+  return { pending: data.pending ?? [], paired: data.paired ?? [] };
+}
+
+/** Collector: the pending device pairing requests, read from the gateway's
+ *  own file (devices/pending.json). Starting `openclaw devices list` takes
+ *  about 5 s; this read takes well under 1 s, so the page can poll it.
+ *  Expiry follows openclaw (pairing-files.ts pruneExpiredPending, 5 min TTL).
+ *  The public key and any other field stay inside the container. */
+export function collectPendingPairing(fs, path, home, nowArg) {
+  const TTL_MS = 5 * 60 * 1000;
+  const now = Number(nowArg) || Date.now();
+  let raw = {};
+  try {
+    raw = JSON.parse(fs.readFileSync(path.join(home, "devices", "pending.json"), "utf8")) || {};
+  } catch {
+    return [];
+  }
+  const out = [];
+  for (const r of Object.values(raw)) {
+    if (!r || typeof r !== "object" || typeof r.requestId !== "string") continue;
+    const seen = Number(r.refreshedAtMs || r.ts);
+    if (!(now - seen <= TTL_MS)) continue;
+    out.push({
+      requestId: r.requestId,
+      clientId: typeof r.clientId === "string" ? r.clientId : null,
+      platform: typeof r.platform === "string" ? r.platform : null,
+      remoteIp: typeof r.remoteIp === "string" ? r.remoteIp : null,
+      scopes: Array.isArray(r.scopes) ? r.scopes.filter((x) => typeof x === "string") : [],
+      ts: Number(r.ts) || null,
+    });
+  }
+  return out;
+}
+
+export function describeBot(inspect, routes, exclude = EXCLUDE_RE) {
+  const container = String(inspect?.Name ?? "").replace(/^\//, "");
+  const mounts = inspect?.Mounts ?? [];
+  if (!container.startsWith(CONTAINER_PREFIX) || !mounts.some((m) => m.Destination === BOT_HOME)) {
+    return null;
+  }
+  const env = envMap(inspect);
+  const agentName = env.get("OASIS_AGENT_NAME") || null;
+  // The key is the bot's .claw-mail mailbox name (orion, vega, samplebot):
+  // short, stable, and what the other fleet tools call the bot. The container
+  // suffix is only the fallback, because Orion's container is "-runtime" and
+  // OASIS_AGENT_NAME is a display name ("Mr. Vega").
+  const inbox = hostPathFor(mounts, "/reach/mail/inbox");
+  const mailbox = inbox ? sanitizeKey(path.basename(path.dirname(inbox))) : null;
+  const key = mailbox || sanitizeKey(container.slice(CONTAINER_PREFIX.length));
+  const hostPort = publishedPort(inspect, GATEWAY_PORT);
+  const swarmDir = env.get("OASIS_SWARM_DIR") || null;
+  const roleFile = hostPathFor(mounts, "/app/role.yaml");
+  return {
+    key,
+    container,
+    agentName,
+    mailbox,
+    state: inspect?.State?.Status ?? "unknown",
+    health: inspect?.State?.Health?.Status ?? null,
+    running: inspect?.State?.Status === "running",
+    excluded: !!exclude && (exclude.test(container) || exclude.test(key)),
+    networks: Object.keys(inspect?.NetworkSettings?.Networks ?? {}),
+    hostPort,
+    declaredPort: declaredPort(inspect, GATEWAY_PORT),
+    role: roleFile ? readRoleFile(roleFile) : null,
+    controlUi: controlUiFor({ container, hostPort }, routes),
+    board: swarmDir ? { containerPath: swarmDir, hostPath: hostPathFor(mounts, swarmDir) } : null,
+  };
+}
+
+// `docker inspect` costs about 3.1 s for EACH container that is only on an
+// internal:true network on this Docker Desktop, and about 60 ms for the others
+// (measured 2026-09-15: 15 s for the whole fleet in one call, 3.1 s in
+// parallel). Everything used from it (name, mounts, env, port bindings,
+// networks) is fixed while a container keeps its ID and state, so it is read
+// once per (ID, state), in parallel. Live state and health come from
+// `docker ps`, which takes about 65 ms for the whole fleet.
+const inspectCache = new Map();
+
+export function parseHealth(status) {
+  const m = String(status ?? "").match(/\((healthy|unhealthy|health: starting)\)/);
+  if (!m) {
+    return null;
+  }
+  return m[1] === "health: starting" ? "starting" : m[1];
+}
+
+export async function discoverFleet() {
+  const rows = (await docker(["ps", "-a", "--no-trunc", "--format", "{{.ID}}\t{{.Names}}\t{{.State}}\t{{.Status}}"]))
+    .split("\n")
+    .map((line) => {
+      const [id, name, state, status] = line.split("\t");
+      return { id, name, state, status };
+    })
+    .filter((r) => r.id && (r.name?.startsWith(CONTAINER_PREFIX) || r.name === PROXY_CONTAINER));
+  if (rows.length === 0) {
+    return { bots: [], proxy: null };
+  }
+  const cacheKey = (r) => `${r.id}:${r.state}`;
+  const wanted = new Set(rows.map(cacheKey));
+  for (const key of inspectCache.keys()) {
+    if (!wanted.has(key)) {
+      inspectCache.delete(key);
+    }
+  }
+  await Promise.all(
+    rows
+      .filter((r) => !inspectCache.has(cacheKey(r)))
+      .map(async (r) => {
+        try {
+          const [inspect] = JSON.parse(await docker(["inspect", r.id]));
+          inspectCache.set(cacheKey(r), inspect);
+        } catch {
+          // removed between `docker ps` and `docker inspect`
+        }
+      }),
+  );
+  const inspects = rows
+    .filter((r) => inspectCache.has(cacheKey(r)))
+    .map((r) => {
+      const inspect = inspectCache.get(cacheKey(r));
+      const health = parseHealth(r.status);
+      return { ...inspect, State: { ...inspect.State, Status: r.state, Health: health ? { Status: health } : undefined } };
+    });
+  const proxyInspect = inspects.find((i) => i.Name === `/${PROXY_CONTAINER}`) ?? null;
+  const proxyRunning = proxyInspect?.State?.Status === "running";
+  const routes = proxyRunning
+    ? parseProxyRoutes(envMap(proxyInspect).get("ROUTES"))
+        .map((r) => ({ ...r, hostPort: publishedPort(proxyInspect, r.listenPort) }))
+        .filter((r) => r.hostPort)
+    : [];
+  const bots = [];
+  const seen = new Set();
+  for (const inspect of inspects) {
+    const bot = describeBot(inspect, routes);
+    if (!bot) {
+      continue;
+    }
+    let key = bot.key;
+    for (let n = 2; seen.has(key); n++) {
+      key = `${bot.key}-${n}`;
+    }
+    seen.add(key);
+    bots.push({ ...bot, key });
+  }
+  bots.sort((a, b) => a.key.localeCompare(b.key));
+  return {
+    bots,
+    proxy: proxyInspect
+      ? {
+          state: proxyInspect.State?.Status ?? "unknown",
+          health: proxyInspect.State?.Health?.Status ?? null,
+          routes,
+          // A gateway sees a proxied browser at one of these addresses
+          // (approveControlUiRequest uses them).
+          addresses: Object.values(proxyInspect.NetworkSettings?.Networks ?? {})
+            .map((n) => n?.IPAddress)
+            .filter(Boolean),
+        }
+      : null,
+  };
+}
+
+// ── collectors (run INSIDE a bot container; self-contained by design) ────────
+
+export function collectProfile(fs, path, home) {
+  const W = path.join(home, "workspace");
+  const MAX_FILE = 2 * 1024 * 1024;
+  const DAY = 24 * 60 * 60 * 1000;
+  const now = Date.now();
+  const regular = (p) => {
+    try {
+      const st = fs.lstatSync(p);
+      return st.isFile() ? st : null;
+    } catch {
+      return null;
+    }
+  };
+  const readText = (p) => {
+    const st = regular(p);
+    if (!st || st.size > MAX_FILE) {
+      return null;
+    }
+    return { text: fs.readFileSync(p, "utf8"), size: st.size, mtimeMs: st.mtimeMs };
+  };
+  const cut = (text, n, mode) => {
+    if (text.length <= n) {
+      return { text, truncated: 0, mode };
+    }
+    return { text: mode === "tail" ? text.slice(-n) : text.slice(0, n), truncated: text.length - n, mode };
+  };
+  const doc = (rel, n, mode = "head") => {
+    const r = readText(path.join(W, rel));
+    return r ? { name: rel, size: r.size, mtimeMs: r.mtimeMs, ...cut(r.text, n, mode) } : null;
+  };
+  const tailLines = (p, maxBytes) => {
+    const st = regular(p);
+    if (!st) {
+      return [];
+    }
+    const start = Math.max(0, st.size - maxBytes);
+    const fd = fs.openSync(p, "r");
+    try {
+      const buf = Buffer.alloc(st.size - start);
+      fs.readSync(fd, buf, 0, buf.length, start);
+      const lines = buf.toString("utf8").split("\n");
+      if (start > 0) {
+        lines.shift();
+      }
+      return lines.filter(Boolean);
+    } finally {
+      fs.closeSync(fd);
+    }
+  };
+  const listMd = (dir) => {
+    let names = [];
+    try {
+      names = fs.readdirSync(dir);
+    } catch {
+      return [];
+    }
+    return names
+      .filter((n) => n.endsWith(".md"))
+      .map((n) => ({ name: n, st: regular(path.join(dir, n)) }))
+      .filter((x) => x.st)
+      .map((x) => ({ name: x.name, size: x.st.size, mtimeMs: x.st.mtimeMs }))
+      .sort((a, b) => a.name.localeCompare(b.name));
+  };
+  const parseJson = (p) => {
+    const r = readText(p);
+    if (!r) {
+      return null;
+    }
+    try {
+      return JSON.parse(r.text);
+    } catch {
+      return null;
+    }
+  };
+
+  const config = parseJson(path.join(home, "openclaw.json")) ?? {};
+  // device.json also holds the private key; take the birth time and nothing else.
+  const device = parseJson(path.join(home, "identity", "device.json"));
+  const createdAtMs = typeof device?.createdAtMs === "number" ? device.createdAtMs : null;
+
+  const identity = doc("IDENTITY.md", 8000);
+  const nameMatch = identity ? identity.text.match(/\*\*Name:?\*\*:?\s*(?!_?\()(.+)/i) : null;
+
+  const phases = {};
+  for (const phase of ["light", "rem", "deep"]) {
+    const dir = path.join(W, "memory", "dreaming", phase);
+    const files = listMd(dir);
+    const last = files[files.length - 1];
+    const lastText = last ? readText(path.join(dir, last.name)) : null;
+    phases[phase] = {
+      count: files.length,
+      latest: last && lastText ? { ...last, ...cut(lastText.text, 10000, "head") } : null,
+    };
+  }
+
+  const notes = listMd(path.join(W, "memory"));
+  const isDaily = (n) => /^\d{4}-\d{2}-\d{2}\.md$/.test(n.name);
+  const daily = notes.filter(isDaily);
+  const topics = notes.filter((n) => !isDaily(n));
+  const lastDaily = daily[daily.length - 1];
+  const lastDailyText = lastDaily ? readText(path.join(W, "memory", lastDaily.name)) : null;
+
+  const reviewer = { rows: 0, window24h: {}, window7d: {}, recent: [] };
+  for (const line of tailLines(path.join(home, "logs", "reviewer", "reviewer-audit.jsonl"), 8 * 1024 * 1024)) {
+    let row;
+    try {
+      row = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    const t = Date.parse(row.ts);
+    if (!Number.isFinite(t)) {
+      continue;
+    }
+    reviewer.rows++;
+    const verdict = String(row.verdict ?? "unknown");
+    if (now - t <= DAY) {
+      reviewer.window24h[verdict] = (reviewer.window24h[verdict] ?? 0) + 1;
+    }
+    if (now - t <= 7 * DAY) {
+      reviewer.window7d[verdict] = (reviewer.window7d[verdict] ?? 0) + 1;
+    }
+    if (verdict !== "allow") {
+      reviewer.recent.push({
+        ts: row.ts,
+        verdict,
+        toolName: row.toolName ?? null,
+        principle: row.principle ?? null,
+        unattended: Boolean(row.unattended),
+        reason: String(row.reason ?? "").slice(0, 500),
+      });
+    }
+  }
+  reviewer.recent = reviewer.recent.slice(-20).reverse();
+
+  const dreamEvents = { promotions: 0, lastPromotion: null, lastDream: {} };
+  for (const line of tailLines(path.join(W, "memory", ".dreams", "events.jsonl"), 2 * 1024 * 1024)) {
+    let e;
+    try {
+      e = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (e.type === "memory.promotion.applied") {
+      dreamEvents.promotions++;
+      dreamEvents.lastPromotion = { ts: e.timestamp ?? null, applied: e.applied ?? null, candidates: e.candidates ?? null };
+    } else if (e.type === "memory.dream.completed" && typeof e.phase === "string") {
+      dreamEvents.lastDream[e.phase] = { ts: e.timestamp ?? null, lineCount: e.lineCount ?? null, outcome: e.outcome ?? null };
+    }
+  }
+
+  return {
+    name: nameMatch ? nameMatch[1].trim() : null,
+    createdAtMs,
+    model: config?.agents?.defaults?.model?.primary ?? null,
+    dreaming: config?.plugins?.entries?.["memory-core"]?.config?.dreaming ?? null,
+    docs: {
+      identity,
+      soul: doc("SOUL.md", 24000),
+      user: doc("USER.md", 12000),
+      memory: doc("MEMORY.md", 60000),
+      dreams: doc("DREAMS.md", 40000, "tail"),
+      agents: doc("AGENTS.md", 24000),
+      tools: doc("TOOLS.md", 12000),
+      heartbeat: doc("HEARTBEAT.md", 4000),
+    },
+    phases,
+    notes: {
+      daily: daily.slice(-60),
+      topics,
+      latestDaily: lastDaily && lastDailyText ? { ...lastDaily, ...cut(lastDailyText.text, 16000, "head") } : null,
+    },
+    reviewer,
+    dreamEvents,
+  };
+}
+
+export function collectSessions(fs, path, home) {
+  const agentsDir = path.join(home, "agents");
+  const toMs = (v) => (typeof v === "number" ? v : Number.isFinite(Date.parse(v)) ? Date.parse(v) : null);
+  const kindOf = (key) => {
+    if (/:subagent:/.test(key)) return "subagent";
+    if (/:cron:/.test(key)) return "cron";
+    if (/:hook:/.test(key)) return "hook";
+    if (/:heartbeat$/.test(key)) return "heartbeat";
+    // memory-core runs each dream phase as its own session
+    if (/:dreaming-/.test(key)) return "dream";
+    if (/:(telegram|discord|slack|whatsapp|signal|webchat):/.test(key)) return "chat";
+    if (/:main$/.test(key)) return "main";
+    return "other";
+  };
+  let agents = [];
+  try {
+    agents = fs.readdirSync(agentsDir).filter((a) => /^[A-Za-z0-9_-]{1,64}$/.test(a));
+  } catch {
+    return { sessions: [] };
+  }
+  const sessions = [];
+  for (const agent of agents) {
+    const dir = path.join(agentsDir, agent, "sessions");
+    const storePath = path.join(dir, "sessions.json");
+    let store;
+    try {
+      const st = fs.lstatSync(storePath);
+      if (!st.isFile() || st.size > 64 * 1024 * 1024) {
+        continue;
+      }
+      store = JSON.parse(fs.readFileSync(storePath, "utf8"));
+    } catch {
+      continue;
+    }
+    for (const [key, s] of Object.entries(store ?? {})) {
+      if (!s || typeof s !== "object") {
+        continue;
+      }
+      const sessionId = typeof s.sessionId === "string" && /^[0-9a-f-]{8,64}$/i.test(s.sessionId) ? s.sessionId : null;
+      let transcript = null;
+      if (sessionId) {
+        try {
+          const st = fs.lstatSync(path.join(dir, `${sessionId}.jsonl`));
+          if (st.isFile()) {
+            transcript = { size: st.size, mtimeMs: st.mtimeMs };
+          }
+        } catch {
+          // no transcript on disk (reset or never written)
+        }
+      }
+      sessions.push({
+        agent,
+        key,
+        kind: kindOf(key),
+        sessionId,
+        status: s.status ?? null,
+        updatedAt: toMs(s.updatedAt),
+        startedAt: toMs(s.startedAt ?? s.sessionStartedAt),
+        endedAt: toMs(s.endedAt),
+        model: s.model ?? null,
+        totalTokens: typeof s.totalTokens === "number" ? s.totalTokens : null,
+        contextTokens: typeof s.contextTokens === "number" ? s.contextTokens : null,
+        compactionCount: typeof s.compactionCount === "number" ? s.compactionCount : 0,
+        lastChannel: s.lastChannel ?? null,
+        transcript,
+      });
+    }
+  }
+  sessions.sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0));
+  return { sessions: sessions.slice(0, 300) };
+}
+
+export function collectTranscript(fs, path, home, agent, sessionId, limitRaw) {
+  if (!/^[A-Za-z0-9_-]{1,64}$/.test(String(agent)) || !/^[0-9a-f-]{8,64}$/i.test(String(sessionId))) {
+    return { error: "invalid session id" };
+  }
+  const limit = Math.min(1000, Math.max(1, Number.parseInt(limitRaw, 10) || 120));
+  const file = path.join(home, "agents", agent, "sessions", `${sessionId}.jsonl`);
+  let st;
+  try {
+    st = fs.lstatSync(file);
+  } catch {
+    return { error: "transcript not found" };
+  }
+  if (!st.isFile()) {
+    return { error: "transcript not found" };
+  }
+  const MAX = 6 * 1024 * 1024;
+  const start = Math.max(0, st.size - MAX);
+  const fd = fs.openSync(file, "r");
+  let lines;
+  try {
+    const buf = Buffer.alloc(st.size - start);
+    fs.readSync(fd, buf, 0, buf.length, start);
+    lines = buf.toString("utf8").split("\n");
+    if (start > 0) {
+      lines.shift();
+    }
+  } finally {
+    fs.closeSync(fd);
+  }
+  const cap = (value, n) => {
+    const s = typeof value === "string" ? value : String(value ?? "");
+    return s.length > n ? `${s.slice(0, n)}\n…[${s.length - n} more characters]` : s;
+  };
+  const entries = [];
+  for (const line of lines) {
+    if (!line) {
+      continue;
+    }
+    let o;
+    try {
+      o = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (o.type !== "message" || !o.message || typeof o.message !== "object") {
+      if (typeof o.type === "string" && o.type !== "session") {
+        entries.push({ event: o.type, ts: o.timestamp ?? null });
+      }
+      continue;
+    }
+    const m = o.message;
+    const parts = [];
+    const limitFor = m.role === "toolResult" ? 4000 : 16000;
+    if (typeof m.content === "string") {
+      parts.push({ t: "text", text: cap(m.content, limitFor) });
+    } else if (Array.isArray(m.content)) {
+      for (const p of m.content) {
+        if (!p || typeof p !== "object") continue;
+        if (p.type === "text") parts.push({ t: "text", text: cap(p.text, limitFor) });
+        else if (p.type === "thinking") parts.push({ t: "thinking", text: cap(p.thinking, 16000) });
+        else if (p.type === "toolCall") {
+          let args;
+          try {
+            args = JSON.stringify(p.arguments ?? {}, null, 2);
+          } catch {
+            args = "[unserializable arguments]";
+          }
+          parts.push({ t: "call", name: String(p.name ?? ""), args: cap(args, 6000), id: typeof p.id === "string" ? p.id.slice(0, 128) : null });
+        } else parts.push({ t: String(p.type ?? "unknown") });
+      }
+    }
+    // Token counts only (the session view shows them per turn).
+    const u = m.usage && typeof m.usage === "object" ? m.usage : null;
+    const n = (v) => (typeof v === "number" && Number.isFinite(v) ? v : null);
+    entries.push({
+      ts: o.timestamp ?? m.timestamp ?? null,
+      role: String(m.role ?? "unknown"),
+      model: m.model ?? null,
+      stopReason: m.stopReason ?? null,
+      toolName: m.toolName ?? null,
+      toolCallId: typeof m.toolCallId === "string" ? m.toolCallId.slice(0, 128) : null,
+      isError: m.isError ?? null,
+      usage: u ? { input: n(u.input), output: n(u.output), cacheRead: n(u.cacheRead), cacheWrite: n(u.cacheWrite), total: n(u.totalTokens) } : null,
+      parts,
+    });
+  }
+  return { size: st.size, mtimeMs: st.mtimeMs, truncatedHead: start > 0, entries: entries.slice(-limit) };
+}
+
+/** Who the bot presents as: IDENTITY.md Name / Emoji / Creature / Avatar,
+ *  the avatar image itself (workspace/avatars/ only, a regular file, 4 MB at
+ *  most, a real PNG, JPEG, GIF or WebP), and the role.yaml `role:` line. */
+export function collectIdentity(fs, path, home, rolePath = "/app/role.yaml") {
+  const W = path.join(home, "workspace");
+  const readFile = (file, max) => {
+    try {
+      const st = fs.lstatSync(file);
+      if (!st.isFile() || st.size > max) return null;
+      return fs.readFileSync(file);
+    } catch {
+      return null;
+    }
+  };
+  const text = (readFile(path.join(W, "IDENTITY.md"), 256 * 1024) || Buffer.alloc(0)).toString("utf8");
+  // An unfilled openclaw template field, such as "_(pick something you like)_",
+  // is no value: the page then falls back to the agent name and its initial.
+  const field = (re) => {
+    const m = text.match(re);
+    const v = m ? m[1].trim() : "";
+    return v && !/^_?\(.*\)_?$/.test(v) ? v : null;
+  };
+  const clip = (s, n) => (s == null ? null : Array.from(s).slice(0, n).join(""));
+  const avatarRel = field(/^\s*[-*]\s*\*\*Avatar:\*\*\s*(.+)$/im);
+  let avatar = null;
+  if (avatarRel && /^avatars\/[A-Za-z0-9][A-Za-z0-9._-]{0,120}$/.test(avatarRel)) {
+    const b = readFile(path.join(W, avatarRel), 4 * 1024 * 1024);
+    if (b) {
+      const mime =
+        b[0] === 0x89 && b.toString("latin1", 1, 4) === "PNG"
+          ? "image/png"
+          : b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff
+            ? "image/jpeg"
+            : b.toString("latin1", 0, 4) === "GIF8"
+              ? "image/gif"
+              : b.toString("latin1", 0, 4) === "RIFF" && b.toString("latin1", 8, 12) === "WEBP"
+                ? "image/webp"
+                : null;
+      if (mime) avatar = { mime, size: b.length, b64: b.toString("base64") };
+    }
+  }
+  const roleText = (readFile(rolePath, 512 * 1024) || Buffer.alloc(0)).toString("utf8");
+  const role = roleText.match(/^role:\s*([A-Za-z0-9][A-Za-z0-9_.-]{0,79})\s*(?:#.*)?$/m);
+  return {
+    name: clip(field(/^\s*[-*]\s*\*\*Name:\*\*\s*(.+)$/im), 80),
+    emoji: clip(field(/^\s*[-*]\s*\*\*Emoji:\*\*\s*(.+)$/im), 4),
+    creature: clip(field(/^\s*[-*]\s*\*\*Creature:\*\*\s*(.+)$/im), 300),
+    role: role ? role[1] : null,
+    avatar,
+  };
+}
+
+export function collectSnapshot(fs, path, home) {
+  const W = path.join(home, "workspace");
+  const ROOT = ["AGENTS.md", "SOUL.md", "TOOLS.md", "IDENTITY.md", "USER.md", "HEARTBEAT.md", "BOOTSTRAP.md", "MEMORY.md", "DREAMS.md"];
+  const NAME = /^[A-Za-z0-9][A-Za-z0-9._-]*\.md$/;
+  const MAX_FILE = 2 * 1024 * 1024;
+  const MAX_TOTAL = 48 * 1024 * 1024;
+  const files = {};
+  const skipped = [];
+  let total = 0;
+  const take = (rel) => {
+    let st;
+    try {
+      st = fs.lstatSync(path.join(W, rel));
+    } catch {
+      return;
+    }
+    if (!st.isFile()) {
+      skipped.push({ file: rel, why: "not a regular file" });
+    } else if (st.size > MAX_FILE) {
+      skipped.push({ file: rel, why: "larger than 2 MB", size: st.size });
+    } else if (total + st.size > MAX_TOTAL) {
+      skipped.push({ file: rel, why: "snapshot total cap reached" });
+    } else {
+      files[rel] = fs.readFileSync(path.join(W, rel), "utf8");
+      total += st.size;
+    }
+  };
+  const mdIn = (rel) => {
+    try {
+      return fs.readdirSync(path.join(W, rel)).filter((n) => NAME.test(n)).sort();
+    } catch {
+      return [];
+    }
+  };
+  ROOT.forEach(take);
+  for (const n of mdIn("memory")) take(`memory/${n}`);
+  for (const phase of ["light", "rem", "deep"]) {
+    for (const n of mdIn(`memory/dreaming/${phase}`)) take(`memory/dreaming/${phase}/${n}`);
+  }
+  let config = {};
+  try {
+    config = JSON.parse(fs.readFileSync(path.join(home, "openclaw.json"), "utf8"));
+  } catch {
+    config = {};
+  }
+  let createdAtMs = null;
+  try {
+    const device = JSON.parse(fs.readFileSync(path.join(home, "identity", "device.json"), "utf8"));
+    createdAtMs = typeof device.createdAtMs === "number" ? device.createdAtMs : null;
+  } catch {
+    createdAtMs = null;
+  }
+  const nameMatch = String(files["IDENTITY.md"] ?? "").match(/\*\*Name:?\*\*:?\s*(?!_?\()(.+)/i);
+  return {
+    files,
+    skipped,
+    meta: {
+      name: nameMatch ? nameMatch[1].trim() : null,
+      createdAtMs,
+      model: config?.agents?.defaults?.model?.primary ?? null,
+      dreaming: config?.plugins?.entries?.["memory-core"]?.config?.dreaming?.frequency ?? null,
+    },
+  };
+}
+
+// ── host-side summaries (System 2 boards, mail) ──────────────────────────────
+
+const ITEM_STATES = {
+  " ": "open",
+  x: "done",
+  X: "done",
+  "/": "in progress",
+  "~": "partial",
+  ">": "claimed",
+  "!": "blocked",
+  "-": "cancelled",
+};
+
+export function boardSummary(swarmDir) {
+  let queue;
+  try {
+    const st = fs.statSync(path.join(swarmDir, "queue.md"));
+    if (st.size > 16 * 1024 * 1024) {
+      return { error: "queue.md is larger than 16 MB" };
+    }
+    queue = fs.readFileSync(path.join(swarmDir, "queue.md"), "utf8");
+  } catch (err) {
+    return { error: `queue.md not readable (${err.code ?? err.message})` };
+  }
+  const counts = {};
+  const open = [];
+  let openTotal = 0;
+  let section = "";
+  const bodies = new Map(parseQueueItems(queue).items.map((it) => [it.id, it.body]));
+  for (const line of queue.split("\n")) {
+    const heading = line.match(/^##\s+(.+?)\s*$/);
+    if (heading) {
+      section = heading[1];
+      continue;
+    }
+    const m = line.match(/^\s*- \[(.)\] \[([A-Za-z][A-Za-z0-9]*-[A-Za-z0-9]+)\]\s*(.*)$/);
+    if (!m) {
+      continue;
+    }
+    const state = ITEM_STATES[m[1]] ?? `[${m[1]}]`;
+    counts[state] = (counts[state] ?? 0) + 1;
+    if (state !== "done" && state !== "cancelled" && !/^done/i.test(section)) {
+      openTotal += 1;
+      if (open.length < 500) {
+        open.push({ id: m[2], state, section, title: m[3].replace(/\*\*/g, "").slice(0, 240), summary: itemSummary(bodies.get(m[2])) });
+      }
+    }
+  }
+  let stateUpdatedMs = null;
+  try {
+    stateUpdatedMs = fs.statSync(path.join(swarmDir, "state.md")).mtimeMs;
+  } catch {
+    stateUpdatedMs = null;
+  }
+  return { counts, open, openTotal, stateUpdatedMs };
+}
+
+// ── .swarm item details, comments and edits (operator, 2026-10-25) ───────────────
+// "Hover tooltips for the human-level description of each .swarm item and the
+// ability to send comments on them and edits for the bots." An item is its
+// `- [x] [ID] title` line plus the more-indented lines under it (priority,
+// notes, refs, ...). A comment goes two places: the item's dot_swarm thread
+// (.swarm/comments/<ID>.jsonl, the format of `swarm comment`, unsigned), and an
+// indented line in the item's queue.md block, because the bots' swarm tools
+// read only state.md and queue.md. An edit replaces the title and the body of
+// one item, only when the block still has the hash the page read (a bot may
+// have changed it since). Writes are temp file + rename inside the .swarm
+// directory, one at a time per file. Only bot boards from fleet discovery are
+// writable (TRUST MODEL item 10).
+const ITEM_LINE_RE = /^(\s*)- \[(.)\] \[([A-Za-z][A-Za-z0-9]*-[A-Za-z0-9]+)\]\s*(.*)$/;
+const ITEM_ID_RE = /^[A-Za-z][A-Za-z0-9]*-[A-Za-z0-9]{1,20}$/;
+const BOARD_ITEM_PATH_RE = /^\/api\/boards\/([a-z0-9-]{1,40})\/items\/([A-Za-z][A-Za-z0-9]*-[A-Za-z0-9]{1,20})$/;
+const isBoardWrite = (method, pathname) => method === "POST" && BOARD_ITEM_PATH_RE.test(pathname);
+const ITEM_TEXT_MAX = 4000;
+const blockHash = (lines) => crypto.createHash("sha256").update(lines.join("\n")).digest("hex").slice(0, 16);
+
+/** Every item in queue.md with its line range and body. */
+export function parseQueueItems(text) {
+  const lines = text.split("\n");
+  const items = [];
+  let section = "";
+  for (let i = 0; i < lines.length; i++) {
+    const heading = lines[i].match(/^##\s+(.+?)\s*$/);
+    if (heading) {
+      section = heading[1];
+      continue;
+    }
+    const m = lines[i].match(ITEM_LINE_RE);
+    if (!m) continue;
+    const indent = m[1].length;
+    let end = i + 1;
+    while (end < lines.length) {
+      const l = lines[end];
+      if (!l.trim() || ITEM_LINE_RE.test(l) || /^##\s/.test(l)) break;
+      if (l.length - l.trimStart().length <= indent) break;
+      end++;
+    }
+    const bodyLines = lines.slice(i + 1, end);
+    const bodyIndent = bodyLines.length ? Math.min(...bodyLines.map((l) => l.length - l.trimStart().length)) : indent + 6;
+    items.push({
+      id: m[3],
+      mark: m[2],
+      state: ITEM_STATES[m[2]] ?? `[${m[2]}]`,
+      section,
+      title: m[4],
+      body: bodyLines.map((l) => l.slice(bodyIndent)).join("\n"),
+      start: i,
+      end,
+      indent,
+      bodyIndent,
+      hash: blockHash(lines.slice(i, end)),
+    });
+  }
+  return { lines, items };
+}
+
+/** A one-paragraph description for a tooltip: the body, whitespace folded. */
+export function itemSummary(body, max = 400) {
+  const s = String(body ?? "").replace(/\s+/g, " ").trim();
+  return s.length > max ? `${s.slice(0, max)}…` : s;
+}
+
+function cleanItemText(v, { multiline }) {
+  if (typeof v !== "string") return null;
+  const s = v.replace(/\r\n?/g, "\n").replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, "");
+  if (!multiline && s.includes("\n")) return null;
+  return s.length <= ITEM_TEXT_MAX ? s : null;
+}
+
+/** queue.md text with one item's title and body replaced. */
+export function replaceItem(text, id, { title, body, hash }) {
+  const { lines, items } = parseQueueItems(text);
+  const it = items.find((x) => x.id === id);
+  if (!it) return { error: `no item ${id} in queue.md`, status: 404 };
+  if (it.hash !== hash) return { error: `${id} changed after this page read it. Reload it, then edit again.`, status: 409, current: it };
+  const pad = " ".repeat(it.bodyIndent);
+  const head = lines[it.start].replace(ITEM_LINE_RE, (_all, ind, mark, itemId) => `${ind}- [${mark}] [${itemId}] ${title.trim()}`);
+  const bodyLines = body.trim() ? body.replace(/\s+$/, "").split("\n").map((l) => (l.trim() ? pad + l : "")) : [];
+  // A blank line would end the block early: keep the body one block.
+  const kept = bodyLines.filter((l) => l !== "");
+  lines.splice(it.start, it.end - it.start, head, ...kept);
+  return { text: lines.join("\n") };
+}
+
+/** queue.md text with a comment line added at the end of one item's block. */
+export function appendItemComment(text, id, line) {
+  const { lines, items } = parseQueueItems(text);
+  const it = items.find((x) => x.id === id);
+  if (!it) return { error: `no item ${id} in queue.md`, status: 404 };
+  lines.splice(it.end, 0, " ".repeat(it.bodyIndent) + line);
+  return { text: lines.join("\n") };
+}
+
+/** One record in the dot_swarm comment format (comments.py, unsigned). */
+export function swarmCommentRecord(itemId, agentId, body, now = new Date()) {
+  const timestamp = now.toISOString().replace(/\.\d{3}Z$/, "Z");
+  const commentId = crypto.createHash("sha256").update(`${itemId}|${agentId}|${timestamp}|${body}`).digest("hex").slice(0, 12);
+  return { comment_id: commentId, item_id: itemId, agent_id: agentId, body, timestamp, in_reply_to: "", signature: "unsigned" };
+}
+
+export function readItemComments(swarmDir, id) {
+  try {
+    return fs
+      .readFileSync(path.join(swarmDir, "comments", `${id}.jsonl`), "utf8")
+      .split("\n")
+      .filter(Boolean)
+      .map((l) => {
+        try {
+          const c = JSON.parse(l);
+          return { id: c.comment_id ?? null, agent: c.agent_id ?? null, body: String(c.body ?? "").slice(0, ITEM_TEXT_MAX), ts: c.timestamp ?? null };
+        } catch {
+          return null;
+        }
+      })
+      .filter(Boolean)
+      .slice(-200);
+  } catch {
+    return [];
+  }
+}
+
+function writeAtomic(file, text) {
+  const tmp = path.join(path.dirname(file), `.${path.basename(file)}.observatory-${process.pid}-${crypto.randomBytes(3).toString("hex")}`);
+  const mode = fs.statSync(file).mode & 0o777;
+  fs.writeFileSync(tmp, text, { mode });
+  fs.renameSync(tmp, file);
+}
+
+const boardLocks = new Map();
+/** Run fn after any earlier write to the same file has finished. */
+function withBoardLock(file, fn) {
+  const prev = boardLocks.get(file) ?? Promise.resolve();
+  const next = prev.then(fn, fn);
+  boardLocks.set(file, next.catch(() => {}));
+  return next;
+}
+
+/** /api/boards/<bot>/items/<ID>  GET   the item (title, body, hash) and its comments
+ *                                 POST  { action: "comment", text } | { action: "edit", title, body, hash } */
+async function routeBoardItem(req, url, ctx) {
+  const [, key, id] = BOARD_ITEM_PATH_RE.exec(url.pathname) ?? [];
+  if (!key || !ITEM_ID_RE.test(id)) return [404, { error: "not found" }];
+  const fleet = await cached(ctx, "fleet", 4000, ctx.discover);
+  const bot = fleet.bots.find((b) => b.key === key);
+  const dir = bot?.board?.hostPath;
+  if (!dir) return [404, { error: `${key} has no .swarm board` }];
+  const queueFile = path.join(dir, "queue.md");
+  const readItem = () => {
+    const st = fs.lstatSync(queueFile);
+    if (!st.isFile() || st.size > 16 * 1024 * 1024) throw Object.assign(new Error("queue.md is not a regular file under 16 MB"), { status: 409 });
+    const text = fs.readFileSync(queueFile, "utf8");
+    return { text, item: parseQueueItems(text).items.find((x) => x.id === id) ?? null };
+  };
+  const view = (it) => ({ id: it.id, state: it.state, section: it.section, title: it.title, body: it.body, hash: it.hash });
+  if (req.method === "GET") {
+    const { item } = readItem();
+    if (!item) return [404, { error: `no item ${id} in ${key}'s queue.md` }];
+    return [200, { bot: key, item: view(item), comments: readItemComments(dir, id) }];
+  }
+  if (req.method !== "POST") return [405, { error: "method not allowed here" }];
+  let body;
+  try {
+    body = JSON.parse((await readBody(req, 32 * 1024)).toString("utf8"));
+  } catch (err) {
+    if (err.status) throw err;
+    return [400, { error: "the body is not valid JSON" }];
+  }
+  return withBoardLock(queueFile, async () => {
+    const { text, item } = readItem();
+    if (!item) return [404, { error: `no item ${id} in ${key}'s queue.md` }];
+    const day = new Date().toISOString().slice(0, 10);
+    if (body?.action === "comment") {
+      const note = cleanItemText(body.text, { multiline: true });
+      if (!note || !note.trim()) return [400, { error: `text: 1-${ITEM_TEXT_MAX} characters` }];
+      const r = appendItemComment(text, id, `► ${operatorName()} (${day}, observatory): ${note.trim().replace(/\s*\n\s*/g, " / ")}`);
+      if (r.error) return [r.status, { error: r.error }];
+      writeAtomic(queueFile, r.text);
+      const rec = swarmCommentRecord(id, "operator", note.trim());
+      fs.mkdirSync(path.join(dir, "comments"), { recursive: true });
+      fs.appendFileSync(path.join(dir, "comments", `${id}.jsonl`), `${JSON.stringify(rec)}\n`);
+      ctx.cache.delete("boards");
+    } else if (body?.action === "edit") {
+      const title = cleanItemText(body.title, { multiline: false });
+      const itemBody = cleanItemText(body.body, { multiline: true });
+      if (!title || !title.trim()) return [400, { error: "title: one line, 1-4000 characters" }];
+      if (itemBody === null) return [400, { error: `body: at most ${ITEM_TEXT_MAX} characters` }];
+      if (typeof body.hash !== "string") return [400, { error: "hash: the hash the page read" }];
+      const r = replaceItem(text, id, { title, body: itemBody, hash: body.hash });
+      if (r.error) return [r.status, { error: r.error, ...(r.current ? { current: view(r.current) } : {}) }];
+      writeAtomic(queueFile, r.text);
+    } else {
+      return [400, { error: "action: comment or edit" }];
+    }
+    const after = readItem().item;
+    return [200, { ok: true, item: after ? view(after) : null, comments: readItemComments(dir, id) }];
+  });
+}
+
+function readEnvelopes(dir, max = 5000) {
+  let names;
+  try {
+    names = fs.readdirSync(dir).filter((n) => n.endsWith(".json")).sort().slice(-max);
+  } catch {
+    return [];
+  }
+  const out = [];
+  for (const name of names) {
+    try {
+      const p = path.join(dir, name);
+      const st = fs.lstatSync(p);
+      if (!st.isFile() || st.size > 1024 * 1024) continue;
+      out.push(JSON.parse(fs.readFileSync(p, "utf8")));
+    } catch {
+      // unreadable or partial envelope — skip
+    }
+  }
+  return out;
+}
+
+export function mailSummary(root, mailbox) {
+  if (!/^[a-z0-9-]{1,40}$/.test(mailbox ?? "")) {
+    return null;
+  }
+  const base = path.join(root, mailbox);
+  if (!fs.existsSync(base)) {
+    return null;
+  }
+  const peers = {};
+  let total = 0;
+  let last = null;
+  const bump = (peer, direction, ts) => {
+    const name = String(peer ?? "");
+    if (!name || name === mailbox) return;
+    peers[name] ??= { received: 0, sent: 0 };
+    peers[name][direction]++;
+    total++;
+    if (typeof ts === "string" && (!last || ts > last)) last = ts;
+  };
+  for (const sub of ["inbox", "archive"]) {
+    for (const env of readEnvelopes(path.join(base, sub))) bump(env.from, "received", env.ts);
+  }
+  for (const env of readEnvelopes(path.join(base, "sent"))) {
+    for (const to of [].concat(env.to ?? [])) bump(to, "sent", env.ts);
+  }
+  return { peers, total, last };
+}
+
+// ── snapshot (System 3 history) ──────────────────────────────────────────────
+
+const SNAPSHOT_PATH_RE =
+  /^(?:(?:AGENTS|SOUL|TOOLS|IDENTITY|USER|HEARTBEAT|BOOTSTRAP|MEMORY|DREAMS)\.md|memory\/[A-Za-z0-9][A-Za-z0-9._-]*\.md|memory\/dreaming\/(?:light|rem|deep)\/[A-Za-z0-9][A-Za-z0-9._-]*\.md)$/;
+
+export function isSnapshotPath(rel) {
+  return typeof rel === "string" && SNAPSHOT_PATH_RE.test(rel) && !rel.split("/").some((s) => s === "." || s === "..");
+}
+
+function listFilesRecursive(dir, prefix = "") {
+  const out = [];
+  let entries;
+  try {
+    entries = fs.readdirSync(path.join(dir, prefix), { withFileTypes: true });
+  } catch {
+    return out;
+  }
+  for (const entry of entries) {
+    const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
+    if (entry.isDirectory()) {
+      out.push(...listFilesRecursive(dir, rel));
+    } else if (entry.isFile()) {
+      out.push(rel);
+    }
+  }
+  return out;
+}
+
+function writeIfChanged(file, content) {
+  let previous = null;
+  try {
+    previous = fs.readFileSync(file, "utf8");
+  } catch {
+    previous = null;
+  }
+  if (previous === content) {
+    return false;
+  }
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(file, content, { mode: 0o600 });
+  return true;
+}
+
+/** Mirror one bot's collected files into botDir. Only allowlisted relative
+ *  paths are written or removed; anything else in the payload is ignored. */
+export function writeBotSnapshot(botDir, { files = {}, meta = {} }) {
+  fs.mkdirSync(botDir, { recursive: true, mode: 0o700 });
+  const root = path.resolve(botDir);
+  const keep = new Set(["meta.json"]);
+  const written = [];
+  const ignored = [];
+  for (const [rel, content] of Object.entries(files)) {
+    const dest = path.resolve(root, rel);
+    if (!isSnapshotPath(rel) || typeof content !== "string" || !dest.startsWith(`${root}${path.sep}`)) {
+      ignored.push(rel);
+      continue;
+    }
+    keep.add(rel);
+    if (writeIfChanged(dest, content)) {
+      written.push(rel);
+    }
+  }
+  const metaText = `${JSON.stringify(
+    {
+      name: meta.name ?? null,
+      createdAtMs: meta.createdAtMs ?? null,
+      model: meta.model ?? null,
+      dreaming: meta.dreaming ?? null,
+    },
+    null,
+    2,
+  )}\n`;
+  if (writeIfChanged(path.join(root, "meta.json"), metaText)) {
+    written.push("meta.json");
+  }
+  const removed = [];
+  for (const rel of listFilesRecursive(root)) {
+    if (!keep.has(rel) && isSnapshotPath(rel)) {
+      fs.rmSync(path.join(root, rel));
+      removed.push(rel);
+    }
+  }
+  return { written, removed, ignored };
+}
+
+async function ensureRepo(dir) {
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  fs.chmodSync(dir, 0o700);
+  if (!fs.existsSync(path.join(dir, ".git"))) {
+    await git(dir, ["init", "-q"]);
+    fs.writeFileSync(
+      path.join(dir, "README.md"),
+      "# Fleet worldview history (CLAW-108)\n\n" +
+        "Written by `scripts/claw-observatory.mjs snapshot`. One directory per bot.\n" +
+        "Each commit is one night. `git log -p -- <bot>/MEMORY.md` shows how a memory changed.\n" +
+        "Local only: never add a remote. These files are the bots' private memory.\n",
+    );
+  }
+}
+
+export async function runSnapshot({
+  dir = DEFAULT_SNAPSHOT_DIR,
+  commit = true,
+  log = console.log,
+  discover = discoverFleet,
+  collectFn = (bot) => collect(bot.container, collectSnapshot, [], { timeoutMs: 120_000 }),
+} = {}) {
+  const fleet = await discover();
+  const included = fleet.bots.filter((b) => b.running && !b.excluded);
+  const skippedBots = fleet.bots.filter((b) => !b.running || b.excluded).map((b) => `${b.key} (${b.excluded ? "excluded" : b.state})`);
+  await ensureRepo(dir);
+  const results = [];
+  let failures = 0;
+  for (const bot of included) {
+    try {
+      const data = await collectFn(bot);
+      const res = writeBotSnapshot(path.join(dir, bot.key), data);
+      results.push({ key: bot.key, ...res, skipped: data.skipped ?? [] });
+      log(`snapshot ${bot.key}: ${res.written.length} changed, ${res.removed.length} removed${data.skipped?.length ? `, ${data.skipped.length} skipped` : ""}`);
+    } catch (err) {
+      failures++;
+      log(`snapshot ${bot.key}: FAILED ${err.message}`);
+    }
+  }
+  let committed = null;
+  if (commit) {
+    await git(dir, ["add", "-A"]);
+    const staged = (await git(dir, ["diff", "--cached", "--name-only"])).trim();
+    if (staged) {
+      const stamp = new Date().toISOString().replace(/\.\d+Z$/, "Z");
+      const changedBots = results.filter((r) => r.written.length || r.removed.length);
+      const body = [
+        ...changedBots.map((r) => `${r.key}: ${[...r.written, ...r.removed.map((f) => `-${f}`)].join(", ")}`),
+        ...(skippedBots.length ? ["", `not read: ${skippedBots.join(", ")}`] : []),
+        ...(failures ? ["", `failed: ${failures}`] : []),
+      ].join("\n");
+      await git(dir, [
+        "-c", "user.name=claw-observatory",
+        "-c", "user.email=claw-observatory@localhost",
+        "commit", "-q", "-m", `snapshot ${stamp}`, "-m", body || "(no per-bot detail)",
+      ]);
+      committed = (await git(dir, ["rev-parse", "--short", "HEAD"])).trim();
+      log(`committed ${committed} in ${dir}`);
+    } else {
+      log("no change since the last snapshot; nothing committed");
+    }
+  }
+  return { results, failures, committed, skippedBots };
+}
+
+export function parseHistoryLog(out, prefix) {
+  const commits = [];
+  for (const record of String(out).split("\x1e")) {
+    const lines = record.split("\n").filter((l) => l.length > 0);
+    if (lines.length === 0) continue;
+    const [sha, date, subject] = lines[0].split("\x1f");
+    if (!/^[0-9a-f]{40}$/.test(sha ?? "")) continue;
+    const files = [];
+    for (const line of lines.slice(1)) {
+      const m = line.match(/^(\d+|-)\t(\d+|-)\t(.+)$/);
+      if (m && m[3].startsWith(prefix)) {
+        files.push({
+          file: m[3].slice(prefix.length),
+          added: m[1] === "-" ? null : Number(m[1]),
+          deleted: m[2] === "-" ? null : Number(m[2]),
+        });
+      }
+    }
+    commits.push({ sha, date, subject, files });
+  }
+  return commits;
+}
+
+async function botHistory(dir, key) {
+  if (!fs.existsSync(path.join(dir, ".git"))) {
+    return { dir, commits: [] };
+  }
+  try {
+    const out = await git(dir, ["log", "-n", "90", "--format=%x1e%H%x1f%cI%x1f%s", "--numstat", "--", `${key}/`]);
+    return { dir, commits: parseHistoryLog(out, `${key}/`) };
+  } catch (err) {
+    // a repo with no commits yet has no HEAD
+    return { dir, commits: [], note: err.message };
+  }
+}
+
+async function botDiff(dir, key, commit, file) {
+  if (!/^[0-9a-f]{7,40}$/.test(commit ?? "") || !(isSnapshotPath(file) || file === "meta.json")) {
+    return { error: "invalid commit or file" };
+  }
+  const out = await git(dir, ["show", "--no-color", "--format=", "--unified=3", commit, "--", `${key}/${file}`]);
+  const MAX = 600 * 1024;
+  return { commit, file, truncated: out.length > MAX, diff: out.slice(0, MAX) };
+}
+
+// ── bot identities (name, emoji, avatar, role) ──────────────────────────────
+// Read once per 30 minutes per bot with `docker exec` (about 3.1 s for a
+// sandboxed bot), kept on disk in the state folder so the page shows every
+// face at once after a restart, including a stopped bot's. A bot matched by
+// the exclude pattern (see excludePattern) stays in memory only.
+
+const IDENTITY_TTL_MS = 30 * 60 * 1000;
+const IDENTITY_RETRY_MS = 2 * 60 * 1000;
+const AVATAR_THUMB_PX = 160;
+
+export function sniffImage(b) {
+  if (!b || b.length < 12) return null;
+  if (b[0] === 0x89 && b.toString("latin1", 1, 4) === "PNG") return "image/png";
+  if (b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff) return "image/jpeg";
+  if (b.toString("latin1", 0, 4) === "GIF8") return "image/gif";
+  if (b.toString("latin1", 0, 4) === "RIFF" && b.toString("latin1", 8, 12) === "WEBP") return "image/webp";
+  return null;
+}
+
+/** A 160 px PNG made with macOS `sips` (the avatars are about 1.1 MB each).
+ *  Falls back to the original when sips is missing or fails. */
+export async function avatarThumbnail(bytes, mime) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "obs-avatar-"));
+  try {
+    const src = path.join(dir, "source");
+    const out = path.join(dir, "thumb.png");
+    fs.writeFileSync(src, bytes);
+    await run("sips", ["-s", "format", "png", "-Z", String(AVATAR_THUMB_PX), src, "--out", out], { timeoutMs: 20_000 });
+    const thumb = fs.readFileSync(out);
+    if (sniffImage(thumb) === "image/png") return { bytes: thumb, mime: "image/png" };
+  } catch {
+    // fall back to the original
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+  return bytes.length <= 2 * 1024 * 1024 && sniffImage(bytes) ? { bytes, mime } : null;
+}
+
+const IDENTITY_KEY_RE = /^[a-z0-9-]{1,40}$/;
+const AVATAR_EXT = { "image/png": "png", "image/jpeg": "jpg", "image/gif": "gif", "image/webp": "webp" };
+
+/** In-memory identities, loaded from and saved to `dir`. */
+export function identityStore(dir) {
+  const mem = new Map();
+  try {
+    for (const name of fs.readdirSync(dir)) {
+      const key = name.replace(/\.json$/, "");
+      if (!name.endsWith(".json") || !IDENTITY_KEY_RE.test(key)) continue;
+      try {
+        const info = JSON.parse(fs.readFileSync(path.join(dir, name), "utf8"));
+        let avatar = null;
+        const ext = AVATAR_EXT[info.avatarMime];
+        if (ext) {
+          const bytes = fs.readFileSync(path.join(dir, `${key}.${ext}`));
+          if (sniffImage(bytes) === info.avatarMime) avatar = { bytes, mime: info.avatarMime, version: info.avatarVersion };
+        }
+        mem.set(key, { ...info, avatar, at: Date.parse(info.updatedAt) || 0 });
+      } catch {
+        // a damaged entry is read again from the bot
+      }
+    }
+  } catch {
+    // no cache yet
+  }
+  return {
+    get: (key) => mem.get(key) ?? null,
+    set(key, raw, avatar, { persist = true } = {}) {
+      const version = avatar ? crypto.createHash("sha256").update(avatar.bytes).digest("hex").slice(0, 12) : null;
+      const entry = {
+        name: raw.name ?? null,
+        emoji: raw.emoji ?? null,
+        creature: raw.creature ?? null,
+        role: raw.role ?? null,
+        avatarMime: avatar?.mime ?? null,
+        avatarVersion: version,
+        updatedAt: new Date().toISOString(),
+      };
+      mem.set(key, { ...entry, avatar: avatar ? { ...avatar, version } : null, at: Date.now() });
+      if (persist && IDENTITY_KEY_RE.test(key)) {
+        fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+        for (const ext of Object.values(AVATAR_EXT)) fs.rmSync(path.join(dir, `${key}.${ext}`), { force: true });
+        if (avatar) fs.writeFileSync(path.join(dir, `${key}.${AVATAR_EXT[avatar.mime]}`), avatar.bytes, { mode: 0o600 });
+        fs.writeFileSync(path.join(dir, `${key}.json`), JSON.stringify(entry, null, 2), { mode: 0o600 });
+      }
+    },
+    markFailed(key) {
+      const entry = mem.get(key);
+      mem.set(key, { ...(entry ?? { avatar: null }), at: entry?.at ?? 0, failedAt: Date.now() });
+    },
+    /** Read the bot again at the next fleet read (after a Studio write). */
+    markStale(key) {
+      const entry = mem.get(key);
+      if (entry) mem.set(key, { ...entry, at: 0, failedAt: undefined });
+    },
+  };
+}
+
+/** Start a background read of one bot's identity when the stored one is old. */
+function maybeRefreshIdentity(ctx, bot) {
+  if (!bot.running || ctx.identityRefreshing.has(bot.key)) return;
+  const entry = ctx.identities.get(bot.key);
+  const now = Date.now();
+  if (entry && now - entry.at < IDENTITY_TTL_MS) return;
+  if (entry?.failedAt && now - entry.failedAt < IDENTITY_RETRY_MS) return;
+  ctx.identityRefreshing.add(bot.key);
+  ctx
+    .readIdentity(bot)
+    .then(async (raw) => {
+      const avatar = raw?.avatar ? await avatarThumbnail(Buffer.from(raw.avatar.b64, "base64"), raw.avatar.mime) : null;
+      ctx.identities.set(bot.key, raw ?? {}, avatar, { persist: !bot.excluded });
+    })
+    .catch(() => ctx.identities.markFailed(bot.key))
+    .finally(() => ctx.identityRefreshing.delete(bot.key));
+}
+
+/** What the page gets for one bot: name, emoji, role, color family, avatar. */
+function publicIdentity(ctx, bot) {
+  const entry = ctx.identities.get(bot.key);
+  const role = bot.role ?? entry?.role ?? null;
+  return {
+    name: entry?.name ?? bot.agentName ?? null,
+    emoji: entry?.emoji ?? null,
+    role,
+    family: roleFamily(role, entry?.creature),
+    avatar: entry?.avatar ? `/api/bots/${bot.key}/avatar?v=${entry.avatar.version}` : null,
+    reading: ctx.identityRefreshing.has(bot.key),
+  };
+}
+
+// ── the page icon (drawn here, so the repo holds no binary) ─────────────────
+
+function pngChunk(type, data) {
+  const len = Buffer.alloc(4);
+  len.writeUInt32BE(data.length);
+  const body = Buffer.concat([Buffer.from(type, "latin1"), data]);
+  const crc = Buffer.alloc(4);
+  crc.writeUInt32BE(zlib.crc32(body));
+  return Buffer.concat([len, body, crc]);
+}
+
+/** A square RGBA PNG: a dark rounded tile with three rings (the three views)
+ *  around a warm center. */
+export function renderIcon(size = 512) {
+  const raw = Buffer.alloc((size * 4 + 1) * size);
+  const c = size / 2;
+  const smooth = (edge, d) => Math.min(1, Math.max(0, edge - d + 0.5));
+  const rings = [
+    { r: 0.36, w: 0.035, rgb: [131, 178, 224] },
+    { r: 0.26, w: 0.035, rgb: [185, 159, 226] },
+    { r: 0.16, w: 0.035, rgb: [110, 199, 190] },
+  ];
+  for (let y = 0; y < size; y++) {
+    const row = y * (size * 4 + 1);
+    raw[row] = 0;
+    for (let x = 0; x < size; x++) {
+      const px = x + 0.5 - c;
+      const py = y + 0.5 - c;
+      // rounded square tile
+      const half = size * 0.47;
+      const radius = size * 0.2;
+      const qx = Math.max(Math.abs(px) - (half - radius), 0);
+      const qy = Math.max(Math.abs(py) - (half - radius), 0);
+      const tile = smooth(radius, Math.hypot(qx, qy));
+      let rgb = [22, 30, 42];
+      const d = Math.hypot(px, py);
+      for (const ring of rings) {
+        const a = smooth(ring.w * size * 0.5, Math.abs(d - ring.r * size));
+        rgb = rgb.map((v, i) => v + (ring.rgb[i] - v) * a);
+      }
+      const dot = smooth(size * 0.06, d);
+      rgb = rgb.map((v, i) => v + ([240, 180, 80][i] - v) * dot);
+      const o = row + 1 + x * 4;
+      raw[o] = Math.round(rgb[0]);
+      raw[o + 1] = Math.round(rgb[1]);
+      raw[o + 2] = Math.round(rgb[2]);
+      raw[o + 3] = Math.round(255 * tile);
+    }
+  }
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(size, 0);
+  ihdr.writeUInt32BE(size, 4);
+  ihdr[8] = 8;
+  ihdr[9] = 6;
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    pngChunk("IHDR", ihdr),
+    pngChunk("IDAT", zlib.deflateSync(raw)),
+    pngChunk("IEND", Buffer.alloc(0)),
+  ]);
+}
+
+const MANIFEST = JSON.stringify({
+  name: "Fleet Observatory",
+  short_name: "Observatory",
+  start_url: "/",
+  scope: "/",
+  display: "standalone",
+  background_color: "#121315",
+  theme_color: "#161e2a",
+  icons: [{ src: "/icon.png", sizes: "512x512", type: "image/png", purpose: "any" }],
+});
+
+// ── user settings: USER.md for every bot, and the page's own settings ────────
+// (operator, 2026-10-08.) The settings page edits each bot's workspace/USER.md
+// (who the human is; openclaw puts it in every session's prompt) and keeps a
+// user profile and the background swarm's parameters in the state folder.
+//
+// A bot also writes its own USER.md as it learns. So the profile goes into
+// one marked block, and an apply replaces only that block. A file that is
+// still the blank openclaw template is replaced whole. A file with the bot's
+// own notes keeps them: the block goes in under the first heading. Every
+// write carries the hash of the text the page saw, and the container refuses
+// it when the file changed since (the bot wrote in between). The previous
+// text is kept in the state folder, which no bot mounts.
+
+export const USER_MD_MAX = 16000;
+export const USER_MD_START = "<!-- fleet-observatory:user-profile:start -->";
+export const USER_MD_END = "<!-- fleet-observatory:user-profile:end -->";
+const USER_MD_HISTORY_KEEP = 30;
+export const PROFILE_FIELDS = [
+  ["name", "Name"],
+  ["callThem", "What to call them"],
+  ["pronouns", "Pronouns"],
+  ["timezone", "Timezone"],
+  ["notes", "Notes"],
+];
+const PROFILE_MAX = { context: 8000 };
+const SETTINGS_FILE = path.join(STATE_DIR, "settings.json");
+const USER_MD_HISTORY_DIR = path.join(STATE_DIR, "user-md-history");
+const SWARM_KEY_RE = /^[A-Z][A-Z0-9_]{0,40}$/;
+export const APPEARANCE_MODES = new Set(["system", "light", "dark"]);
+
+/** Read ("read") or replace ("write") workspace/USER.md inside a bot
+ *  container. A write needs the hash of the current text (or "missing"), and
+ *  takes the new text as base64. Self-contained: it runs as `node -e`. */
+export function collectUserMd(fs, path, home, op, baseHash, b64) {
+  const MAX = 16000;
+  const file = path.join(home, "workspace", "USER.md");
+  // cyrb53-style hash: a change check, not a security check.
+  const hash = (s) => {
+    let h1 = 0xdeadbeef ^ s.length;
+    let h2 = 0x41c6ce57 ^ s.length;
+    for (let i = 0; i < s.length; i++) {
+      const c = s.charCodeAt(i);
+      h1 = Math.imul(h1 ^ c, 2654435761);
+      h2 = Math.imul(h2 ^ c, 1597334677);
+    }
+    h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+    h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+    return (h2 >>> 0).toString(16).padStart(8, "0") + (h1 >>> 0).toString(16).padStart(8, "0");
+  };
+  const read = () => {
+    let st;
+    try {
+      st = fs.lstatSync(file);
+    } catch (err) {
+      if (err.code === "ENOENT") return { exists: false, text: "", hash: "missing", size: 0, mtimeMs: null };
+      throw err;
+    }
+    if (!st.isFile()) return { error: "USER.md is not a regular file" };
+    if (st.size > 256 * 1024) return { error: "USER.md is larger than 256 KB" };
+    const text = fs.readFileSync(file, "utf8");
+    return { exists: true, text, hash: hash(text), size: st.size, mtimeMs: st.mtimeMs };
+  };
+  const current = read();
+  if (op !== "write" || current.error) return current;
+  if (current.hash !== baseHash) return { conflict: true, ...current };
+  const text = Buffer.from(String(b64 ?? ""), "base64").toString("utf8");
+  if (text.length > MAX) return { error: `the new text is longer than ${MAX} characters` };
+  const dir = path.dirname(file);
+  if (!fs.lstatSync(dir).isDirectory()) return { error: "the workspace is not a directory" };
+  const tmp = path.join(dir, `.USER.md.observatory-${Date.now()}`);
+  fs.writeFileSync(tmp, text, { mode: 0o644, flag: "wx" });
+  fs.renameSync(tmp, file);
+  return { written: true, ...read() };
+}
+
+const profileValue = (profile, key) => String(profile?.[key] ?? "").trim();
+
+/** The managed block: the profile fields and the context, between markers. */
+export function renderProfileBlock(profile) {
+  const lines = [
+    USER_MD_START,
+    "<!-- Written from the Fleet Observatory settings. An edit inside this block is replaced on the next apply; add your own notes outside it. -->",
+    ...PROFILE_FIELDS.map(([key, label]) => `- **${label}:** ${profileValue(profile, key).replace(/\s*\n\s*/g, " ")}`.trimEnd()),
+  ];
+  const context = profileValue(profile, "context");
+  if (context) lines.push("", "### Context", "", context);
+  lines.push(USER_MD_END);
+  return lines.join("\n");
+}
+
+/** True when the text is still openclaw's blank USER.md template: no field
+ *  filled in, and nothing in Context but the italic prompt. */
+export function isBlankUserTemplate(text) {
+  if (!/^#\s*USER\.md\b/m.test(text) || text.includes(USER_MD_START)) return false;
+  for (const [, label] of PROFILE_FIELDS) {
+    const m = text.match(new RegExp(`^\\s*-\\s*\\*\\*${label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}:\\*\\*(.*)$`, "m"));
+    if (m && m[1].replace(/_\(optional\)_/i, "").trim()) return false;
+  }
+  const context = text.split(/^##\s*Context\s*$/m)[1]?.split(/^---\s*$/m)[0] ?? "";
+  return context
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean)
+    .every((l) => /^_.*_$/.test(l));
+}
+
+/** A whole USER.md for a bot that has no notes of its own yet. */
+export function renderUserMd(profile) {
+  return [
+    "# USER.md - About Your Human",
+    "",
+    renderProfileBlock(profile),
+    "",
+    "## What I have learned",
+    "",
+    "_(Add what you learn about this person here, below the block above.)_",
+    "",
+  ].join("\n");
+}
+
+/** The new USER.md after an apply of the profile to the current text. */
+export function mergeUserMd(current, profile) {
+  const text = String(current ?? "");
+  const block = renderProfileBlock(profile);
+  const start = text.indexOf(USER_MD_START);
+  const end = text.indexOf(USER_MD_END, start);
+  if (start >= 0 && end > start) return text.slice(0, start) + block + text.slice(end + USER_MD_END.length);
+  if (!text.trim() || isBlankUserTemplate(text)) return renderUserMd(profile);
+  const heading = text.match(/^#[^#].*$/m);
+  if (!heading) return `${block}\n\n${text}`;
+  const at = heading.index + heading[0].length;
+  return `${text.slice(0, at)}\n\n${block}\n${text.slice(at)}`;
+}
+
+/** Check a settings change from the page. Returns the clean patch, or throws
+ *  with status 400. */
+export function validateSettings(patch) {
+  const bad = (msg) => Object.assign(new Error(msg), { status: 400 });
+  if (!patch || typeof patch !== "object" || Array.isArray(patch)) throw bad("the body must be a JSON object");
+  const out = {};
+  for (const key of Object.keys(patch)) {
+    if (key !== "profile" && key !== "swarm" && key !== "appearance") throw bad(`unknown setting "${key}"`);
+  }
+  if (patch.appearance !== undefined) {
+    const a = patch.appearance;
+    if (!a || typeof a !== "object" || Array.isArray(a)) throw bad("appearance must be an object");
+    for (const k of Object.keys(a)) if (k !== "mode") throw bad(`unknown appearance field "${k}"`);
+    if (!APPEARANCE_MODES.has(a.mode)) throw bad("appearance.mode must be system, light or dark");
+    out.appearance = { mode: a.mode };
+  }
+  if (patch.profile !== undefined) {
+    const p = patch.profile;
+    if (!p || typeof p !== "object" || Array.isArray(p)) throw bad("profile must be an object");
+    const allowed = new Set([...PROFILE_FIELDS.map(([k]) => k), "context"]);
+    out.profile = {};
+    for (const [k, v] of Object.entries(p)) {
+      if (!allowed.has(k)) throw bad(`unknown profile field "${k}"`);
+      if (typeof v !== "string") throw bad(`profile.${k} must be text`);
+      const max = PROFILE_MAX[k] ?? 400;
+      if (v.length > max) throw bad(`profile.${k} is longer than ${max} characters`);
+      out.profile[k] = v;
+    }
+  }
+  if (patch.swarm !== undefined) {
+    const s = patch.swarm;
+    if (s === null) {
+      out.swarm = {};
+    } else {
+      if (typeof s !== "object" || Array.isArray(s)) throw bad("swarm must be an object or null");
+      const keys = Object.keys(s);
+      if (keys.length > 80) throw bad("too many swarm parameters");
+      out.swarm = {};
+      for (const k of keys) {
+        if (!SWARM_KEY_RE.test(k)) throw bad(`bad swarm parameter name "${k}"`);
+        if (typeof s[k] !== "number" || !Number.isFinite(s[k])) throw bad(`swarm.${k} must be a finite number`);
+        out.swarm[k] = s[k];
+      }
+    }
+  }
+  return out;
+}
+
+/** settings.json in the state folder: { profile, swarm, appearance, updatedAt }.
+ *  appearance.mode is the page's Appearance choice; the Control UI open
+ *  carries it to each bot's Control UI (controlUiSignedInUrl). */
+export function settingsStore(file) {
+  const read = () => {
+    try {
+      const v = JSON.parse(fs.readFileSync(file, "utf8"));
+      const mode = APPEARANCE_MODES.has(v.appearance?.mode) ? v.appearance.mode : "system";
+      return { profile: v.profile ?? {}, swarm: v.swarm ?? {}, appearance: { mode }, updatedAt: v.updatedAt ?? null };
+    } catch {
+      return { profile: {}, swarm: {}, appearance: { mode: "system" }, updatedAt: null };
+    }
+  };
+  return {
+    read,
+    update(patch) {
+      const next = { ...read(), ...validateSettings(patch), updatedAt: new Date().toISOString() };
+      fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+      const tmp = `${file}.${process.pid}.tmp`;
+      fs.writeFileSync(tmp, JSON.stringify(next, null, 2) + "\n", { mode: 0o600 });
+      fs.renameSync(tmp, file);
+      return next;
+    },
+  };
+}
+
+/** Keep the text a write replaced: <dir>/<bot>/<time>.md, newest 30. */
+export function keepUserMdHistory(dir, key, text) {
+  const botDir = path.join(dir, key);
+  fs.mkdirSync(botDir, { recursive: true, mode: 0o700 });
+  const name = `${new Date().toISOString().replace(/[:.]/g, "-")}.md`;
+  fs.writeFileSync(path.join(botDir, name), text, { mode: 0o600 });
+  const all = fs.readdirSync(botDir).filter((n) => n.endsWith(".md")).sort();
+  for (const old of all.slice(0, Math.max(0, all.length - USER_MD_HISTORY_KEEP))) fs.rmSync(path.join(botDir, old));
+  return name;
+}
+
+const SETTINGS_PATH_RE = /^\/api\/settings$/;
+const USER_MD_PATH_RE = /^\/api\/user-md(?:\/([a-z0-9-]{1,40})(?:\/(preview))?)?$/;
+const isSettingsWrite = (method, pathname) =>
+  method === "PUT" && (SETTINGS_PATH_RE.test(pathname) || /^\/api\/user-md\/[a-z0-9-]{1,40}$/.test(pathname));
+
+/** /api/settings and /api/user-md[/<bot>[/preview]]. Returns [status, json].
+ *  settings          GET   { profile, swarm, appearance, updatedAt }
+ *                    PUT   { profile?, swarm?, appearance? }: merge and keep
+ *  user-md           GET   every bot's USER.md, and the profile
+ *  user-md/<bot>     PUT   { text, baseHash }: replace that bot's USER.md
+ *  user-md/<bot>/preview
+ *                    GET   the text an apply of the saved profile gives */
+async function routeSettings(req, url, ctx) {
+  if (SETTINGS_PATH_RE.test(url.pathname)) {
+    if (req.method === "GET") return [200, ctx.settings.read()];
+    if (req.method === "PUT") {
+      let patch;
+      try {
+        patch = JSON.parse((await readBody(req, 64 * 1024)).toString("utf8"));
+      } catch (err) {
+        if (err.status) throw err;
+        return [400, { error: "the body is not valid JSON" }];
+      }
+      return [200, ctx.settings.update(patch)];
+    }
+    return [405, { error: "method not allowed here" }];
+  }
+  const [, key, sub] = USER_MD_PATH_RE.exec(url.pathname) ?? [];
+  const fleet = await cached(ctx, "fleet", 4000, ctx.discover);
+  if (!key) {
+    if (req.method !== "GET") return [405, { error: "method not allowed here" }];
+    const bots = await Promise.all(
+      fleet.bots.map(async (bot) => {
+        const base = { key: bot.key, running: bot.running, state: bot.state };
+        if (!bot.running) return { ...base, error: `${bot.container} is ${bot.state}` };
+        try {
+          return { ...base, ...(await ctx.readUserMd(bot)) };
+        } catch (err) {
+          return { ...base, error: err.message };
+        }
+      }),
+    );
+    return [200, { profile: ctx.settings.read().profile, bots }];
+  }
+  const bot = fleet.bots.find((b) => b.key === key);
+  if (!bot) return [404, { error: `unknown bot "${key}"` }];
+  if (!bot.running) return [409, { error: `${bot.container} is ${bot.state}` }];
+  if (sub === "preview") {
+    if (req.method !== "GET") return [405, { error: "method not allowed here" }];
+    const current = await ctx.readUserMd(bot);
+    if (current.error) return [409, { error: current.error }];
+    return [200, { text: mergeUserMd(current.text, ctx.settings.read().profile), baseHash: current.hash }];
+  }
+  if (req.method !== "PUT") return [405, { error: "method not allowed here" }];
+  let body;
+  try {
+    body = JSON.parse((await readBody(req, 128 * 1024)).toString("utf8"));
+  } catch (err) {
+    if (err.status) throw err;
+    return [400, { error: "the body is not valid JSON" }];
+  }
+  if (typeof body?.text !== "string") return [400, { error: "text must be a string" }];
+  if (typeof body.baseHash !== "string" || !/^(missing|[0-9a-f]{16})$/.test(body.baseHash)) return [400, { error: "baseHash is missing or malformed" }];
+  if (body.text.length > USER_MD_MAX) return [413, { error: `USER.md is limited to ${USER_MD_MAX} characters` }];
+  const before = await ctx.readUserMd(bot);
+  if (before.error) return [409, { error: before.error }];
+  const result = await ctx.writeUserMd(bot, body.baseHash, body.text);
+  if (result.error) return [409, { error: result.error }];
+  if (result.conflict) {
+    const { conflict: _c, ...current } = result;
+    return [409, { error: `${bot.key} changed its USER.md after this page read it. Reload, then apply again.`, current }];
+  }
+  // The text this write replaced. Taken from the read just before the write;
+  // the container compared hashes, so it is the text that was replaced.
+  if (before.exists && before.hash === body.baseHash) ctx.keepUserMdHistory(bot.key, before.text);
+  return [200, result];
+}
+
+// ── oasis-generation route switch (GEN-008) ─────────────────────────────────
+//
+// Each bot's model calls go to the Mac gateway. The gateway serves them itself
+// ("local") or forwards them to the Hetzner VM gateway ("remote"), per bot.
+// This page switches any bot through the gateway's admin API. The admin token
+// is a file only this host process reads; no bot holds it, and the browser
+// never sees it.
+
+const GEN_ADMIN_URL = process.env.OASIS_GENERATION_ADMIN_URL ?? "http://127.0.0.1:8800";
+const GEN_ADMIN_TOKEN_FILE =
+  process.env.OASIS_GENERATION_ADMIN_TOKEN_FILE ??
+  path.join(HOME, "Library", "Application Support", "oasis-x", "generation", "admin-token");
+const GENROUTE_PATH_RE = /^\/api\/genroute(?:\/([a-z0-9-]{1,40}))?$/;
+const GEN_TARGETS = new Set(["local", "remote"]);
+// Observatory bot key -> gateway client name, where they differ. The gateway
+// names a client by its service token entry (ADM-050), the observatory by the
+// container name.
+const GEN_CLIENT_OF = { samplebot: "sample-bot" };
+export const genClientOf = (key) => GEN_CLIENT_OF[key] ?? key;
+const genKeyOf = (client) => Object.keys(GEN_CLIENT_OF).find((k) => GEN_CLIENT_OF[k] === client) ?? client;
+const isGenrouteWrite = (method, pathname) => method === "PUT" && /^\/api\/genroute\/[a-z0-9-]{1,40}$/.test(pathname);
+
+/** Call the gateway admin API. Returns [status, json]; never exposes the token. */
+export async function genAdmin(method, apiPath, body, { url = GEN_ADMIN_URL, tokenFile = GEN_ADMIN_TOKEN_FILE, fetchImpl = fetch } = {}) {
+  let token;
+  try {
+    token = fs.readFileSync(tokenFile, "utf8").trim();
+  } catch {
+    return [503, { error: "no gateway admin token file on this Mac" }];
+  }
+  if (!token) return [503, { error: "the gateway admin token file is empty" }];
+  try {
+    const res = await fetchImpl(`${url}${apiPath}`, {
+      method,
+      headers: { authorization: `Bearer ${token}`, ...(body ? { "content-type": "application/json" } : {}) },
+      body: body ? JSON.stringify(body) : undefined,
+      signal: AbortSignal.timeout(5000),
+    });
+    const json = await res.json().catch(() => ({}));
+    if (!res.ok) return [res.status, { error: typeof json.detail === "string" ? json.detail : `gateway HTTP ${res.status}` }];
+    return [200, json];
+  } catch (err) {
+    return [502, { error: `oasis-generation gateway unreachable: ${err.name}` }];
+  }
+}
+
+/** /api/genroute          GET  every client's route + whether a remote exists
+ *  /api/genroute/<bot>    PUT  { target: "local" | "remote" } */
+async function routeGenroute(req, url, ctx) {
+  const [, key] = GENROUTE_PATH_RE.exec(url.pathname) ?? [];
+  if (!key) {
+    if (req.method !== "GET") return [405, { error: "method not allowed here" }];
+    const [status, body] = await ctx.genAdmin("GET", "/admin/routing");
+    if (status === 200 && body?.clients) {
+      body.clients = Object.fromEntries(Object.entries(body.clients).map(([c, t]) => [genKeyOf(c), t]));
+    }
+    return [status, body];
+  }
+  if (req.method !== "PUT") return [405, { error: "method not allowed here" }];
+  let body;
+  try {
+    body = JSON.parse((await readBody(req, 1024)).toString("utf8"));
+  } catch (err) {
+    if (err.status) throw err;
+    return [400, { error: "the body is not valid JSON" }];
+  }
+  if (!GEN_TARGETS.has(body?.target)) return [400, { error: "target must be local or remote" }];
+  return ctx.genAdmin("PUT", `/admin/routing/${encodeURIComponent(genClientOf(key))}`, { target: body.target });
+}
+
+// ── Studio: avatars, IDENTITY.md and Control UI themes (2026-10-30) ─────────
+//
+// The operator: "the correct content is loaded and settable for each agent's Control
+// UI", and "an observatory location for using built-in AI (oasis-generation,
+// oasis-ai, etc.) to make edits to avatars, themes, etc." The logic is in
+// claw-observatory-studio.mjs; see trust model item 12.
+
+const STUDIO_MODULE = new URL("./claw-observatory-studio.mjs", import.meta.url);
+let studioModule = null;
+const loadStudio = () => (studioModule ??= import(STUDIO_MODULE));
+const STUDIO_THEME_DIR = path.join(STATE_DIR, "control-ui-themes");
+const IDENTITY_MD_HISTORY_DIR = path.join(STATE_DIR, "identity-md-history");
+/** The observatory's own oasis-generation key (`make observatory-ai-key`):
+ *  a service token named "observatory" in the gateway's list. */
+export const GEN_KEY_FILE = path.join(STATE_DIR, "generation-key");
+const STUDIO_PATH_RE = /^\/api\/studio\/(?:(models)|([a-z0-9-]{1,40})(?:\/(identity|avatar|avatar-use|theme|draft))?)$/;
+const STUDIO_WRITES = { identity: ["PUT"], avatar: ["PUT"], "avatar-use": ["POST"], theme: ["PUT", "DELETE"], draft: ["POST"] };
+const isStudioWrite = (method, pathname) => (STUDIO_WRITES[STUDIO_PATH_RE.exec(pathname)?.[3]] ?? []).includes(method);
+const STUDIO_IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/webp"]);
+
+async function studioThemes(ctx) {
+  ctx.studioThemes ??= (await loadStudio()).themeStore(STUDIO_THEME_DIR);
+  return ctx.studioThemes;
+}
+
+async function readJsonBody(req, max) {
+  try {
+    return JSON.parse((await readBody(req, max)).toString("utf8"));
+  } catch (err) {
+    if (err.status) throw err;
+    throw Object.assign(new Error("the body is not valid JSON"), { status: 400 });
+  }
+}
+
+/** One bot as the Studio shows it: the IDENTITY.md fields, the identity the
+ *  Control UI uses, which picture the Control UI shows, and the theme. */
+async function studioBot(ctx, bot, studio) {
+  const theme = (await studioThemes(ctx)).get(bot.key);
+  const base = {
+    key: bot.key,
+    running: bot.running,
+    state: bot.state,
+    themeable: bot.controlUi?.via === "proxy",
+    controlUiVia: bot.controlUi?.via ?? null,
+    theme,
+    themeWarnings: theme ? studio.paletteWarnings(theme) : [],
+    aiReady: ctx.genKeyReady(),
+  };
+  if (!bot.running) return { ...base, error: `${bot.container} is ${bot.state}` };
+  const [md, config] = await Promise.all([ctx.readIdentityMd(bot), ctx.readIdentityConfig(bot)]);
+  if (md.error) return { ...base, error: md.error };
+  const fields = studio.parseIdentityFields(md.text);
+  const avatarFiles = (md.avatars ?? []).map((n) => `avatars/${n}`);
+  return {
+    ...base,
+    identityMd: { exists: md.exists, hash: md.hash, fields },
+    config: config.error ? null : config,
+    face: studio.controlUiFace(config.error ? null : config, fields),
+    avatars: avatarFiles,
+    avatarMissing: Boolean(fields.avatar) && !avatarFiles.includes(fields.avatar),
+  };
+}
+
+/** Write IDENTITY.md with `change(text)`, keep the replaced text, and read
+ *  the bot's face again. Returns [status, json]. */
+async function writeIdentity(ctx, bot, baseHash, change) {
+  const before = await ctx.readIdentityMd(bot);
+  if (before.error) return [409, { error: before.error }];
+  if (baseHash !== undefined && before.hash !== baseHash) {
+    return [409, { error: `${bot.key} changed its IDENTITY.md after this page read it. Reload, then save again.` }];
+  }
+  const next = change(before.text);
+  if (next === before.text) return [200, { unchanged: true }];
+  const result = await ctx.writeIdentityMd(bot, before.hash, next);
+  if (result.error) return [409, { error: result.error }];
+  if (result.conflict) return [409, { error: `${bot.key} wrote its IDENTITY.md during this save. Reload, then save again.` }];
+  if (before.exists) ctx.keepIdentityMdHistory(bot.key, before.text);
+  ctx.identities.markStale(bot.key);
+  maybeRefreshIdentity(ctx, bot);
+  return [200, { written: true, hash: result.hash }];
+}
+
+/** Make `rel` the bot's avatar: the IDENTITY.md Avatar line, then the agent
+ *  identity in openclaw.json, which the Control UI reads first. */
+async function useAvatar(ctx, bot, rel, studio) {
+  const [status, body] = await writeIdentity(ctx, bot, undefined, (text) => studio.setIdentityFields(text, { avatar: rel }));
+  if (status !== 200) return [status, body];
+  try {
+    await ctx.setIdentityAvatar(bot, rel);
+  } catch (err) {
+    return [502, { error: `IDENTITY.md names ${rel}, but \`openclaw agents set-identity\` failed: ${err.message}` }];
+  }
+  return [200, { avatar: rel }];
+}
+
+/** /api/studio/models          GET     the oasis-generation models
+ *  /api/studio/<bot>           GET     the bot as the Studio shows it
+ *  /api/studio/<bot>/identity  PUT     { fields, baseHash }: IDENTITY.md fields
+ *  /api/studio/<bot>/avatar    PUT     an image body: a new avatar
+ *  /api/studio/<bot>/avatar-use POST   { avatar }: use an avatar the bot has
+ *  /api/studio/<bot>/theme     PUT     { label, light, dark } / DELETE
+ *  /api/studio/<bot>/draft     POST    { kind, prompt, model, colors }: a draft
+ *                                      from oasis-generation (nothing is saved) */
+async function routeStudio(req, url, ctx) {
+  const [, models, key, sub] = STUDIO_PATH_RE.exec(url.pathname) ?? [];
+  const studio = await loadStudio();
+  if (models) {
+    if (req.method !== "GET") return [405, { error: "method not allowed here" }];
+    return [200, { models: await ctx.genModels(), default: studio.DEFAULT_MODEL }];
+  }
+  const fleet = await cached(ctx, "fleet", 4000, ctx.discover);
+  const bot = fleet.bots.find((b) => b.key === key);
+  if (!bot) return [404, { error: `unknown bot "${key}"` }];
+  if (!sub) {
+    if (req.method !== "GET") return [405, { error: "method not allowed here" }];
+    return [200, await studioBot(ctx, bot, studio)];
+  }
+  if (!(STUDIO_WRITES[sub] ?? []).includes(req.method)) return [405, { error: "method not allowed here" }];
+
+  if (sub === "theme") {
+    const themes = await studioThemes(ctx);
+    if (req.method === "DELETE") {
+      themes.remove(key);
+      return [200, { theme: null }];
+    }
+    const theme = themes.set(key, await readJsonBody(req, 16 * 1024));
+    return [200, { theme, warnings: studio.paletteWarnings(theme) }];
+  }
+  if (sub === "draft") {
+    const body = await readJsonBody(req, 16 * 1024);
+    if (!studio.DRAFT_KINDS.has(body?.kind)) return [400, { error: "kind must be theme, avatar or identity" }];
+    const facts = { key, role: bot.role ?? null, name: null, emoji: null, fields: {} };
+    if (bot.running) {
+      const md = await ctx.readIdentityMd(bot);
+      if (!md.error) facts.fields = studio.parseIdentityFields(md.text);
+      const config = await ctx.readIdentityConfig(bot);
+      if (!config.error) Object.assign(facts, { name: config.name, emoji: config.emoji });
+    }
+    const current = body.kind === "theme" ? (await studioThemes(ctx)).get(key) : null;
+    const messages = studio.draftMessages(body.kind, {
+      bot: facts,
+      prompt: typeof body.prompt === "string" ? body.prompt : "",
+      colors: body.colors,
+      current: current ? { light: current.light, dark: current.dark } : null,
+    });
+    const reply = await ctx.genChat({ model: typeof body.model === "string" ? body.model : "", messages });
+    return [200, { kind: body.kind, model: reply.model, ...studio.parseDraft(body.kind, reply.text) }];
+  }
+
+  if (!bot.running) return [409, { error: `${bot.container} is ${bot.state}` }];
+  if (sub === "identity") {
+    const body = await readJsonBody(req, 32 * 1024);
+    if (typeof body?.baseHash !== "string" || !/^(missing|[0-9a-f]{16})$/.test(body.baseHash)) return [400, { error: "baseHash is missing or malformed" }];
+    const fields = studio.validateIdentityFields(body.fields);
+    return writeIdentity(ctx, bot, body.baseHash, (text) => studio.setIdentityFields(text, fields));
+  }
+  if (sub === "avatar-use") {
+    const body = await readJsonBody(req, 1024);
+    const rel = String(body?.avatar ?? "");
+    if (!studio.AVATAR_REL_RE.test(rel)) return [400, { error: "avatar must be avatars/<file>" }];
+    const md = await ctx.readIdentityMd(bot);
+    if (md.error) return [409, { error: md.error }];
+    if (!(md.avatars ?? []).includes(rel.slice("avatars/".length))) return [404, { error: `${bot.key} has no ${rel}` }];
+    return useAvatar(ctx, bot, rel, studio);
+  }
+  // sub === "avatar": a new image
+  const type = String(req.headers["content-type"] ?? "").split(";")[0].trim().toLowerCase();
+  if (!STUDIO_IMAGE_TYPES.has(type)) return [415, { error: "send a PNG, JPEG or WebP image" }];
+  const bytes = await readBody(req, studio.AVATAR_MAX_BYTES);
+  if (sniffImage(bytes) !== type) return [400, { error: `the body is not a ${type} image` }];
+  const name = studio.avatarFileName(key, type);
+  const written = await ctx.writeAvatar(bot, name, bytes);
+  if (written.error) return [409, { error: written.error }];
+  return useAvatar(ctx, bot, written.avatar, studio);
+}
+
+// ── Access (operator, 2026-11-02) ────────────────────────────────────────────────
+// Who may do what, per bot: read only (trust model item 13). The logic is in
+// claw-observatory-access.mjs.
+
+const ACCESS_MODULE = new URL("./claw-observatory-access.mjs", import.meta.url);
+let accessModule = null;
+const loadAccess = () => (accessModule ??= import(ACCESS_MODULE));
+const ACCESS_PATH_RE = /^\/api\/access$/;
+// The main checkout, also when this file runs from a worktree: bind sources
+// are main-checkout paths.
+const REPO_ROOT = path.resolve(SCRIPT_DIR, "..").replace(/\/\.claude\/worktrees\/[^/]+$/, "");
+
+/** The cached `docker inspect` of one container (discoverFleet fills it). */
+export function cachedInspect(container) {
+  for (const inspect of inspectCache.values()) {
+    if (inspect?.Name === `/${container}`) return inspect;
+  }
+  return null;
+}
+
+async function routeAccess(req, ctx) {
+  if (req.method !== "GET") return [405, { error: "the Access view only reads" }];
+  const access = await loadAccess();
+  const f = await cached(ctx, "fleet", 4000, ctx.discover);
+  const bots = await cached(ctx, "access", 30_000, () =>
+    Promise.all(
+      f.bots.map(async (bot) => {
+        const inspect = ctx.inspectFor(bot.container);
+        const hasRole = (inspect?.Mounts ?? []).some((m) => m.Destination === access.ROLE_MOUNT);
+        const [live, declared] = await Promise.all([
+          bot.running ? ctx.readAccessConfig(bot).catch((err) => ({ error: err.message })) : null,
+          bot.running && hasRole ? ctx.readRoleDeclared(bot).catch((err) => ({ error: err.message })) : null,
+        ]);
+        const policyFile = hostPathFor(inspect?.Mounts, access.POLICY_MOUNT);
+        return access.describeAccess({
+          bot,
+          inspect,
+          live,
+          declared,
+          policy: policyFile ? await ctx.readPolicy(policyFile) : null,
+          home: HOME,
+          repoRoot: REPO_ROOT,
+        });
+      }),
+    ),
+  );
+  // What may be edited, read fresh: a cached hash would refuse the next edit.
+  const edit = await loadAccessEdit();
+  const files = ctx.policyFiles ?? edit.policyFiles(ctx.repoRoot);
+  const policySet = edit.readPolicySet(files);
+  const withEdit = bots.map((a) => {
+    try {
+      return { ...a, edit: edit.accessEditState({ inspect: ctx.inspectFor(a.container), repoRoot: ctx.repoRoot, files, policySet }) };
+    } catch (err) {
+      return { ...a, edit: { error: err.message } };
+    }
+  });
+  return [200, { bots: withEdit, levels: access.LEVELS }];
+}
+
+// ── Access edits (operator, 2026-11-06) ──────────────────────────────────────────
+// Phase 2 of the access design, step 5 part 1 (trust model item 15). The logic
+// is in claw-observatory-access-edit.mjs.
+
+const ACCESS_EDIT_MODULE = new URL("./claw-observatory-access-edit.mjs", import.meta.url);
+let accessEditModule = null;
+const loadAccessEdit = () => (accessEditModule ??= import(ACCESS_EDIT_MODULE));
+const ACCESS_EDIT_PATH_RE = /^\/api\/access\/([a-z0-9-]{1,40})\/edit$/;
+const isAccessWrite = (method, pathname) => method === "POST" && ACCESS_EDIT_PATH_RE.test(pathname);
+const ACCESS_HISTORY_DIR = path.join(STATE_DIR, "access-history");
+
+/** /api/access/<bot>/edit  POST  { setting, op, value, baseHash, reason } */
+async function routeAccessEdit(req, url, ctx) {
+  if (req.method !== "POST") return [405, { error: "an access edit is a POST" }];
+  const key = ACCESS_EDIT_PATH_RE.exec(url.pathname)[1];
+  const f = await cached(ctx, "fleet", 4000, ctx.discover);
+  const bot = f.bots.find((b) => b.key === key && !b.excluded);
+  if (!bot) return [404, { error: `no bot ${key} in the fleet` }];
+  const body = await readJsonBody(req, 16 * 1024);
+  const edit = await loadAccessEdit();
+  const r = await edit.applyAccessEdit(bot.key, body, {
+    repoRoot: ctx.repoRoot,
+    files: ctx.policyFiles,
+    inspect: ctx.inspectFor(bot.container),
+    container: bot.container,
+    running: !!bot.running,
+    parseRole: (text) => ctx.parseRoleInBot(bot.container, text),
+    authorityDir: ctx.authorityDir,
+    rootSigner: () => ctx.rootSigner(ctx.authorityDir),
+    hubSigner: ctx.hubSigner,
+    historyDir: ctx.accessHistoryDir,
+  });
+  // The next GET reads the files again (the edit state is never cached), and
+  // the drift of this bot changed.
+  if (r.ok) ctx.cache.delete("access");
+  return r.error ? [r.status ?? 400, { error: r.error }] : [200, r];
+}
+
+// ── Authority (operator, 2026-11-03) ─────────────────────────────────────────────
+// The authority hub on one page (trust model item 14). The logic is in
+// claw-observatory-authority.mjs; the log and the root key in claw-authority.mjs.
+
+const AUTHORITY_MODULE = new URL("./claw-observatory-authority.mjs", import.meta.url);
+let authorityModule = null;
+const loadAuthorityView = () => (authorityModule ??= import(AUTHORITY_MODULE));
+const AUTHORITY_PATH_RE = /^\/api\/authority(?:\/(restrict|lift|keep))?$/;
+const isAuthorityWrite = (method, pathname) => method === "POST" && !!AUTHORITY_PATH_RE.exec(pathname)?.[1];
+
+/** /api/authority                              GET   the page model
+ *  /api/authority/restrict|lift|keep           POST  one root-signed event (Touch ID) */
+async function routeAuthority(req, url, ctx) {
+  const op = AUTHORITY_PATH_RE.exec(url.pathname)[1];
+  const mod = await loadAuthorityView();
+  const f = await cached(ctx, "fleet", 4000, ctx.discover);
+  // The same bots as the daemon's views: excluded deployments stay out.
+  const bots = f.bots.filter((b) => !b.excluded);
+  if (!op) {
+    if (req.method !== "GET") return [405, { error: "an authority action is a POST to /api/authority/restrict, lift or keep" }];
+    const health = await cached(ctx, "authority-health", 30_000, async () =>
+      Object.fromEntries(
+        await Promise.all(bots.map(async (b) => [b.key, b.running ? await ctx.readReviewerHealth(b).catch((err) => ({ error: err.message })) : null])),
+      ),
+    );
+    return [200, mod.authorityPage({ dir: ctx.authorityDir, viewDir: ctx.authorityViewDir, plist: ctx.authorityPlist, bots, inspectFor: ctx.inspectFor, health })];
+  }
+  if (req.method !== "POST") return [405, { error: "an authority action is a POST" }];
+  const body = await readJsonBody(req, 16 * 1024);
+  const r = await mod.runAction(op, body, { dir: ctx.authorityDir, botKeys: bots.map((b) => b.key), signer: () => ctx.rootSigner(ctx.authorityDir) });
+  return r.error ? [r.status ?? 400, { error: r.error }] : [200, r];
+}
+
+// ── observatory HTTP server ──────────────────────────────────────────────────
+
+const SECURITY_HEADERS = {
+  "cache-control": "no-store",
+  "x-content-type-options": "nosniff",
+  "referrer-policy": "no-referrer",
+  "x-frame-options": "DENY",
+  "content-security-policy":
+    "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data: blob:; manifest-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+};
+
+const WRITE_METHODS = new Set(["POST", "PUT", "DELETE"]);
+const isFeedbackPath = (pathname) => pathname === "/api/feedback" || pathname.startsWith("/api/feedback/");
+const CONTROL_UI_PATH_RE = /^\/api\/control-ui\/([a-z0-9-]{1,40})\/(open|approve|pairing)$/;
+const isControlUiWrite = (pathname) => ["open", "approve"].includes(CONTROL_UI_PATH_RE.exec(pathname)?.[2]);
+
+/** Refuse anything that did not come from a page this server served on
+ *  loopback. Returns null when the request may proceed. */
+export function checkRequest(req, port) {
+  const host = String(req.headers.host ?? "").toLowerCase();
+  if (host !== `127.0.0.1:${port}` && host !== `localhost:${port}`) {
+    return { status: 421, error: "wrong Host header" };
+  }
+  const origin = req.headers.origin;
+  if (origin !== undefined && origin !== `http://127.0.0.1:${port}` && origin !== `http://localhost:${port}`) {
+    return { status: 403, error: "foreign Origin" };
+  }
+  if (req.method === "GET" || req.method === "HEAD") {
+    return null;
+  }
+  const pathname = String(req.url ?? "").split("?")[0];
+  const writable =
+    isFeedbackPath(pathname) ||
+    isControlUiWrite(pathname) ||
+    isSettingsWrite(req.method, pathname) ||
+    isGenrouteWrite(req.method, pathname) ||
+    isCronWrite(req.method, pathname) ||
+    isBoardWrite(req.method, pathname) ||
+    isFleetWrite(req.method, pathname) ||
+    isStudioWrite(req.method, pathname) ||
+    isAuthorityWrite(req.method, pathname) ||
+    isAccessWrite(req.method, pathname) ||
+    (req.method === "POST" && pathname === DECIDE_PATH);
+  if (!WRITE_METHODS.has(req.method) || !writable) {
+    return { status: 405, error: "read-only" };
+  }
+  // A browser always sends Origin with a POST, PUT or DELETE fetch. A write
+  // without one did not come from this page.
+  if (origin === undefined) {
+    return { status: 403, error: "a write needs this page's Origin" };
+  }
+  return null;
+}
+
+export function tokenMatches(req, token) {
+  const got = Buffer.from(String(req.headers["x-observatory-token"] ?? ""));
+  const want = Buffer.from(String(token));
+  return got.length === want.length && crypto.timingSafeEqual(got, want);
+}
+
+function send(res, status, body, type) {
+  res.writeHead(status, { ...SECURITY_HEADERS, "content-type": type });
+  res.end(body);
+}
+
+const sendJson = (res, status, value) => send(res, status, JSON.stringify(value), "application/json; charset=utf-8");
+
+/** Share one read per key. A read still in flight is always shared: a docker
+ *  exec can take seconds on a busy fleet, and a second exec started behind a
+ *  slow one only makes both slower. The TTL counts from when the read settles;
+ *  a failed read is not kept. */
+export function cached(ctx, key, ttlMs, fn) {
+  const hit = ctx.cache.get(key);
+  if (hit && (hit.pending || Date.now() - hit.at < ttlMs)) {
+    return hit.promise;
+  }
+  const entry = { at: Date.now(), pending: true, promise: null };
+  entry.promise = fn().then(
+    (value) => {
+      entry.pending = false;
+      entry.at = Date.now();
+      return value;
+    },
+    (err) => {
+      if (ctx.cache.get(key) === entry) {
+        ctx.cache.delete(key);
+      }
+      throw err;
+    },
+  );
+  ctx.cache.set(key, entry);
+  return entry.promise;
+}
+
+function httpReachable(url) {
+  return new Promise((resolve) => {
+    const req = http.get(url, { timeout: 1500 }, (res) => {
+      res.resume();
+      resolve(true);
+    });
+    req.on("timeout", () => req.destroy());
+    req.on("error", () => resolve(false));
+  });
+}
+
+const pickItem = (i) => ({
+  id: i.id ?? null,
+  // dot_swarm WorkItem carries the item text in "description"
+  title: i.description ?? i.title ?? null,
+  state: i.state ?? null,
+  priority: i.priority ?? null,
+  project: i.project ?? null,
+  claimedBy: i.claimed_by ?? null,
+  claimedAt: i.claimed_at ?? null,
+});
+
+// ── the colony: every .swarm division under the dot_swarm root ──────────────
+// Read by calling dot_swarm's own get_colony_summary() with the dot_swarm
+// venv's Python, not through the dashboard's HTTP API: the page must show the
+// colony even when the dashboard is not running.
+
+const COLONY_SNIPPET = [
+  "import json, sys",
+  "from pathlib import Path",
+  "from dot_swarm.operations import get_colony_summary",
+  "print(json.dumps(get_colony_summary(Path(sys.argv[1]))))",
+].join("\n");
+
+export function swarmPython(env = process.env) {
+  if (env.OASIS_SWARM_PYTHON) return env.OASIS_SWARM_PYTHON;
+  if (env.OASIS_SWARM_BIN) return path.join(path.dirname(env.OASIS_SWARM_BIN), "python");
+  return "python3";
+}
+
+export async function readColony(root, python = swarmPython()) {
+  return JSON.parse(await run(python, ["-c", COLONY_SNIPPET, root], { timeoutMs: 120_000 }));
+}
+
+// ── the dot_swarm dashboard, started beside the observatory ────────────────
+// History: until dot_swarm's 2026-09-28 fix, `swarm gui` served its write
+// token inside GET /, needed no token for a read, and accepted a write with no
+// Origin. Docker Desktop forwards host.docker.internal to the Mac's loopback,
+// so Orion and Sample Bot could read every board and write to it as the
+// human (measured 2026-09-22, CLAW-108 §5 item 6). The fixed dashboard needs
+// its token on every /api/ route, and takes the token from SWARM_GUI_TOKEN.
+// verifySwarmDashboard() proves that fixed behavior before the page links to
+// the dashboard; an older dot_swarm is stopped at once.
+
+/** GET a loopback URL; resolve { status, body } or null if unreachable. */
+function httpGet(url, headers = {}, timeoutMs = 3000) {
+  return new Promise((resolve) => {
+    const req = http.get(url, { headers, timeout: timeoutMs }, (res) => {
+      const chunks = [];
+      let size = 0;
+      res.on("data", (c) => {
+        size += c.length;
+        if (size <= 4 * 1024 * 1024) chunks.push(c);
+      });
+      res.on("end", () => resolve({ status: res.statusCode, body: Buffer.concat(chunks).toString("utf8") }));
+      res.on("error", () => resolve(null));
+    });
+    req.on("timeout", () => req.destroy());
+    req.on("error", () => resolve(null));
+  });
+}
+
+/** Resolve null when the dashboard at `url` has the fixed token behavior,
+ *  or a reason string when it does not. */
+export async function verifySwarmDashboard(url, token) {
+  const page = await httpGet(url);
+  if (!page || page.status !== 200) return `GET / answered ${page ? page.status : "nothing"}`;
+  if (page.body.includes(token)) return "GET / hands out the session token (dot_swarm older than the 2026-09-28 fix)";
+  const anon = await httpGet(new URL("/api/state.json", url).href);
+  if (!anon || anon.status !== 401) {
+    return `GET /api/state.json without the token answered ${anon ? anon.status : "nothing"}, not 401 (dot_swarm older than the 2026-09-28 fix)`;
+  }
+  const authed = await httpGet(new URL("/api/state.json", url).href, { "X-Swarm-Token": token }, 120_000);
+  if (!authed || authed.status !== 200) return `GET /api/state.json with the token answered ${authed ? authed.status : "nothing"}`;
+  return null;
+}
+
+/**
+ * Start `swarm gui` on 127.0.0.1:port with a fresh token, and verify it.
+ * Resolves one of:
+ *   { state: "managed", url, openUrl, stop() }   started and verified
+ *   { state: "foreign", url }                    the port already answers; not ours
+ *   { state: "failed",  url, reason }            not started, or stopped again
+ */
+export async function startSwarmDashboard({
+  bin,
+  root,
+  port = SWARM_PORT,
+  token = crypto.randomBytes(32).toString("base64url"),
+  env = process.env,
+  timeoutMs = 20_000,
+} = {}) {
+  const url = `http://127.0.0.1:${port}/`;
+  if (await httpReachable(url)) return { state: "foreign", url };
+
+  let child;
+  try {
+    child = spawn(bin, ["--path", root, "gui", "--port", String(port)], {
+      env: { ...env, SWARM_GUI_TOKEN: token },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  } catch (err) {
+    return { state: "failed", url, reason: `cannot start ${bin}: ${err.message}` };
+  }
+  // Keep only the last lines, for an error report. The dashboard prints its
+  // own token URL; this process never echoes it.
+  const tail = [];
+  const keep = (chunk) => {
+    for (const line of String(chunk).split("\n")) {
+      if (line.trim() && !line.includes(token)) tail.push(line.trim());
+    }
+    tail.splice(0, Math.max(0, tail.length - 5));
+  };
+  child.stdout.on("data", keep);
+  child.stderr.on("data", keep);
+  let exited = null;
+  child.on("exit", (code, signal) => {
+    exited = signal ?? `exit ${code}`;
+  });
+  child.on("error", (err) => {
+    exited = err.message;
+  });
+
+  const stop = () => {
+    if (exited === null) child.kill("SIGTERM");
+  };
+  const fail = (reason) => {
+    stop();
+    return { state: "failed", url, reason: tail.length ? `${reason} — ${tail.join(" | ")}` : reason };
+  };
+
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (exited !== null) return fail(`${bin} stopped (${exited})`);
+    const page = await httpGet(url, {}, 1000);
+    if (page?.status === 200) break;
+    if (Date.now() > deadline) return fail(`no answer on ${url} after ${timeoutMs / 1000} s`);
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  const refused = await verifySwarmDashboard(url, token);
+  if (refused) return fail(`not linked: ${refused}`);
+  return { state: "managed", url, openUrl: `${url}#t=${token}`, stop, child };
+}
+
+async function lastSnapshotCommit(dir) {
+  if (!fs.existsSync(path.join(dir, ".git"))) return null;
+  try {
+    const [sha, date, subject] = (await git(dir, ["log", "-1", "--format=%h%x1f%cI%x1f%s"])).trim().split("\x1f");
+    return sha ? { sha, date, subject } : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Read a request body of at most maxBytes. */
+function readBody(req, maxBytes) {
+  return new Promise((resolve, reject) => {
+    const declared = Number(req.headers["content-length"]);
+    if (Number.isFinite(declared) && declared > maxBytes) {
+      reject(Object.assign(new Error(`the body is larger than ${maxBytes} bytes`), { status: 413 }));
+      return;
+    }
+    const chunks = [];
+    let size = 0;
+    let failed = false;
+    req.on("data", (chunk) => {
+      if (failed) return;
+      size += chunk.length;
+      if (size > maxBytes) {
+        failed = true;
+        reject(Object.assign(new Error(`the body is larger than ${maxBytes} bytes`), { status: 413 }));
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on("end", () => {
+      if (!failed) resolve(Buffer.concat(chunks));
+    });
+    req.on("error", (err) => {
+      if (!failed) reject(err);
+    });
+  });
+}
+
+const FEEDBACK_JSON_MAX = 32 * 1024;
+const FEEDBACK_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+/** Open the feedback store on first use. */
+export function lazyFeedbackStore(dir = DEFAULT_FEEDBACK_DIR) {
+  let opening = null;
+  return () => (opening ??= import(FEEDBACK_MODULE.href).then((m) => m.openFeedbackStore(dir)));
+}
+
+// ── feedback to the bots (operator, 2026-10-07, R5) ──────────────────────────────
+// A submitted change request goes, as console mail, to the bots it names. The
+// default is the primary Oasis-X bots. The envelope is the one that
+// claw-mail.mjs `send` writes; the relay stamps `from=console` from the outbox
+// directory and applies its route table and audit.
+export const DEFAULT_FEEDBACK_TO = (process.env.OASIS_OBSERVATORY_FEEDBACK_TO || "lyra,samplebot,altair")
+  .split(",")
+  .map((b) => b.trim())
+  .filter(Boolean);
+
+/** Write one console mail into the outbox under `root`. Returns its id. */
+export function queueConsoleMail(root, { to, subject, body, thread = "", items = [] }) {
+  const dir = path.join(root, "console", "outbox");
+  fs.mkdirSync(dir, { recursive: true });
+  const env = {
+    id: `m_${crypto.randomBytes(12).toString("hex")}`,
+    to: [to],
+    kind: "dm",
+    subject,
+    body,
+    refs: [],
+    work: { items, repos: [] },
+    thread_id: thread,
+    ts: new Date().toISOString(),
+  };
+  const tmp = path.join(dir, `.${env.id}.json.tmp`);
+  fs.writeFileSync(tmp, JSON.stringify(env, null, 2), { flag: "wx" });
+  fs.renameSync(tmp, path.join(dir, `${env.id}.json`));
+  return env.id;
+}
+
+/** The mail a bot gets for one change request: text and page context only.
+ *  Screenshots stay on the Mac (a screenshot can show other agents' memory). */
+export function feedbackMail(item, names = {}) {
+  const ctx = item.context ?? {};
+  const first = item.body.trim().split("\n")[0].slice(0, 70);
+  const recipients = (item.deliveries ?? []).map((d) => names[d.bot] ?? d.bot);
+  const where = [
+    ctx.view ? `view: ${ctx.view}` : null,
+    ctx.bot ? `bot: ${ctx.bot}` : null,
+    Array.isArray(ctx.chosenBots) && ctx.chosenBots.length ? `bots in view: ${ctx.chosenBots.join(", ")}` : null,
+    ctx.build ? `build: ${ctx.build}` : null,
+  ].filter(Boolean);
+  const images = item.attachments?.length ?? 0;
+  const body = [
+    `Change request ${item.ref} from ${operatorName()}, written on the Fleet Observatory page (CLAW-108).`,
+    `Sent to: ${recipients.join(", ")}.`,
+    "",
+    item.body.trim(),
+    "",
+    where.length ? `Page context — ${where.join("; ")}.` : null,
+    images
+      ? `${images} screenshot(s) are attached on ${operatorName()}'s Mac only. They are not sent, because a screenshot can show other agents' memory.`
+      : null,
+    "",
+    `This is a request to consider, not an authorization. Reply to console in thread ${item.ref} with what you will do, or why not.`,
+  ]
+    .filter((l) => l !== null)
+    .join("\n");
+  return { subject: `Observatory feedback ${item.ref}: ${first}`, body, thread: item.ref, items: ["CLAW-108"] };
+}
+
+/** Mail every recipient of a submitted request that has no mail yet. */
+async function deliverFeedback(store, item, ctx) {
+  const fleet = await cached(ctx, "fleet", 4000, ctx.discover);
+  const names = Object.fromEntries(fleet.bots.map((b) => [b.key, b.identity?.name || b.agentName || b.key]));
+  const mail = feedbackMail(item, names);
+  for (const d of item.deliveries ?? []) {
+    if (d.mailId) continue;
+    try {
+      store.recordDelivery(item.id, d.bot, { mailId: ctx.sendMail({ to: d.bot, ...mail }) });
+    } catch (err) {
+      store.recordDelivery(item.id, d.bot, { error: String(err.message ?? err).slice(0, 300) });
+    }
+  }
+  return store.get(item.id);
+}
+
+/** /api/feedback routes. Returns [status, json] or [204, null]. */
+async function routeFeedback(req, url, ctx) {
+  const store = await ctx.feedbackStore();
+  const parts = url.pathname.split("/").filter(Boolean);
+  const id = parts[2];
+  if (id !== undefined && !FEEDBACK_ID_RE.test(id)) return [404, { error: "no such request" }];
+  const type = String(req.headers["content-type"] ?? "").split(";")[0].trim().toLowerCase();
+
+  if (parts.length === 2 && req.method === "GET") {
+    return [200, { feedback: store.list({ status: url.searchParams.get("status") || undefined, limit: url.searchParams.get("limit") || 20 }).map(publicItem) }];
+  }
+  if (parts.length === 2 && req.method === "POST") {
+    if (type !== "application/json") return [415, { error: "send application/json" }];
+    let input;
+    try {
+      input = JSON.parse((await readBody(req, FEEDBACK_JSON_MAX)).toString("utf8"));
+    } catch (err) {
+      if (err.status) throw err;
+      return [400, { error: "the body is not valid JSON" }];
+    }
+    // The server adds what the page cannot know (the build). The size limit
+    // applies to the page's part only.
+    const fleet = await cached(ctx, "fleet", 4000, ctx.discover);
+    const created = store.create(input, {
+      author: ctx.author ?? null,
+      extra: ctx.build ? { build: ctx.build } : {},
+      defaultTo: ctx.feedbackTo.filter((b) => fleet.bots.some((x) => x.key === b)),
+      knownBots: fleet.bots.map((b) => b.key),
+    });
+    return [201, created];
+  }
+  if (parts.length === 3 && req.method === "GET") {
+    return [200, publicItem(store.get(id))];
+  }
+  if (parts.length === 3 && req.method === "DELETE") {
+    store.withdraw(id);
+    return [204, null];
+  }
+  if (parts.length === 4 && parts[3] === "submit" && req.method === "POST") {
+    const submitted = store.submit(id);
+    return [200, publicItem(submitted.status === "new" ? await deliverFeedback(store, submitted, ctx) : submitted)];
+  }
+  if (parts.length === 5 && parts[3] === "files" && req.method === "PUT") {
+    if (!/^[1-9]$/.test(parts[4])) return [404, { error: "no such image slot" }];
+    const data = await readBody(req, ctx.maxImageBytes ?? 10 * 1024 * 1024);
+    store.storeFile(id, Number(parts[4]), type, data);
+    return [204, null];
+  }
+  return [405, { error: "method not allowed here" }];
+}
+
+// The page never needs where an image lies on the Mac.
+const publicItem = (item) => ({
+  ...item,
+  attachments: item.attachments.map(({ path: _hidden, ...rest }) => rest),
+});
+
+/** /api/control-ui/<bot>/{open,pairing,approve}. Returns [status, json].
+ *  open      POST  the signed-in address, and start the pairing window
+ *  pairing   GET   pending Control UI requests for this bot, judged
+ *  approve   POST  {requestId}: pair that browser (judged again here) */
+async function routeControlUi(req, url, ctx) {
+  const [, key, action] = CONTROL_UI_PATH_RE.exec(url.pathname) ?? [];
+  if (!key) return [404, { error: "not found" }];
+  const fleet = await cached(ctx, "fleet", 4000, ctx.discover);
+  const bot = fleet.bots.find((b) => b.key === key);
+  if (!bot) return [404, { error: `unknown bot "${key}"` }];
+  if (!bot.running) return [409, { error: `${bot.container} is ${bot.state}` }];
+  const judge = (r) => judgeControlUiRequest(r, { proxyAddresses: fleet.proxy?.addresses ?? [], armedAt: ctx.pairingArmed.get(key) ?? null });
+
+  if (action === "open" && req.method === "POST") {
+    const { mode, token } = await ctx.readGatewayToken(bot);
+    if (mode !== "token") return [409, { error: `${bot.key}: gateway auth mode is ${mode ?? "unknown"}, not token` }];
+    const look = { mode: ctx.settings.read().appearance?.mode, theme: null };
+    if (bot.controlUi.via === "proxy") {
+      const palette = (await studioThemes(ctx)).get(key);
+      if (palette) {
+        const studio = await loadStudio();
+        look.theme = studio.themeFragment(studio.controlUiCustomTheme(key, palette, palette.updatedAt));
+      }
+    }
+    const openUrl = controlUiSignedInUrl(bot, { proxyKey: ctx.proxyKey(), gatewayToken: token, ...look });
+    if (!openUrl) return [409, { error: `${bot.key} has no reachable Control UI (${bot.controlUi.via})` }];
+    ctx.pairingArmed.set(key, Date.now());
+    return [200, { url: openUrl }];
+  }
+  if (action === "pairing" && req.method === "GET") {
+    const pending = await ctx.readPendingPairing(bot);
+    return [
+      200,
+      {
+        pending: pending
+          .filter((r) => r.clientId === CONTROL_UI_CLIENT)
+          .map((r) => ({
+            requestId: r.requestId,
+            platform: r.platform ?? null,
+            remoteIp: r.remoteIp ?? null,
+            scopes: r.scopes ?? [],
+            ts: r.ts ?? null,
+            ...judge(r),
+          })),
+      },
+    ];
+  }
+  if (action === "approve" && req.method === "POST") {
+    let requestId;
+    try {
+      requestId = JSON.parse((await readBody(req, 1024)).toString("utf8")).requestId;
+    } catch (err) {
+      if (err.status) throw err;
+      return [400, { error: "the body is not valid JSON" }];
+    }
+    if (!REQUEST_ID_RE.test(String(requestId ?? ""))) return [400, { error: "invalid request id" }];
+    const request = (await ctx.readPendingPairing(bot)).find((r) => r.requestId === requestId);
+    if (!request) return [404, { error: "no such pending request" }];
+    const verdict = judge(request);
+    if (!verdict.ok) return [403, { error: verdict.reason }];
+    await ctx.approveDevice(bot.container, requestId);
+    return [200, { approved: requestId }];
+  }
+  return [405, { error: "method not allowed here" }];
+}
+
+// ── approvals panel (CLAW-122 slice 2) ────────────────────────────────────────
+// Everything the operator approves: peer grants (autoreviewer bot), GitHub access
+// requests and the minter's result, the infra ledger, and the approval-card
+// outcomes in the fleet snapshot. Since 2026-10-25 the operator also decides here: see
+// "decisions from this page" below (TRUST MODEL item 9). The infra ledger stays
+// read-only here (scripts/claw-approvals on the Mac).
+const OASIS_SUPPORT = path.join(HOME, "Library", "Application Support", "oasis-x");
+
+function readJsonQuiet(file, fallback) {
+  try {
+    return JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch {
+    return fallback;
+  }
+}
+
+export function readApprovals(support = OASIS_SUPPORT, now = Date.now()) {
+  const DAY = 86_400_000;
+  const recent = (iso) => iso && now - Date.parse(iso) <= DAY;
+  const ledger = readJsonQuiet(path.join(support, "approvals", "peer-grants", "peer-grants.json"), {}).grants ?? [];
+  const live = (g) => g.status === "proposed" || g.status === "active" || recent(g.approved_at) || recent(g.proposed_at);
+  // CLAW-124: directives share the ledger (kind "directive", one bot, up to 7 days).
+  const directives = ledger
+    .filter((g) => g.kind === "directive" && (live(g) || recent(g.expires)))
+    .map((g) => ({
+      id: g.id, status: g.status, bot: g.grantees?.[0] ?? null, proposer: g.requester, lane: g.lane ?? null,
+      goal: g.topic, may: g.intent, must_not: g.must_not ?? null, path_prefixes: g.path_prefixes,
+      proposed_at: g.proposed_at, proposal_expires: g.proposal_expires, approved_at: g.approved_at, expires: g.expires,
+    }));
+  const grants = ledger
+    .filter((g) => g.kind !== "directive" && live(g))
+    .map((g) => ({
+      id: g.id, status: g.status, requester: g.requester, grantees: g.grantees ?? [], thread: g.thread_id,
+      topic: g.topic, intent: g.intent, families: g.families, path_prefixes: g.path_prefixes, max_actions: g.max_actions,
+      proposed_at: g.proposed_at, proposal_expires: g.proposal_expires, approved_at: g.approved_at, expires: g.expires,
+    }));
+  const ghStatus = readJsonQuiet(path.join(support, "github-grants", "status.json"), {});
+  const github = (readJsonQuiet(path.join(support, "github-grants", "approved.json"), {}).requests ?? []).map((r) => ({
+    id: r.id, status: r.status, requester: r.requester, bot: r.bot, account: r.account, repos: r.repos ?? [], access: r.access,
+    reason: r.reason, proposed_at: r.proposed_at, decided_at: r.decided_at, minter: ghStatus[r.id] ?? null,
+  }));
+  const infra = (readJsonQuiet(path.join(support, "approvals", "infra-ledger.json"), {}).entries ?? []).map((e) => ({
+    id: e.id, status: e.status, title: e.title, requesters: e.requesters ?? [], dirs: e.dir_prefixes ?? [],
+    patterns: e.command_patterns ?? [], limits: e.limits ?? [], expires: e.expires ?? null, approved_at: e.approved_at ?? null,
+  }));
+  const snap = readJsonQuiet(path.join(support, "fleet-snapshot", "snapshot.json"), null);
+  const cards = snap
+    ? Object.entries(snap.bots ?? {}).map(([bot, b]) => ({
+        bot,
+        health_only: !!b.health_only,
+        cards24h: b.reviewer?.cards24h ?? {},
+        escalations: (b.reviewer?.recent ?? []).filter((x) => x.verdict === "escalate").slice(0, 5),
+      }))
+    : [];
+  // CLAW-124: open work from each STATUS.md and the morning-job state, parsed
+  // and redacted by the fleet snapshot exporter; the coordinator's brief.
+  const work = snap
+    ? Object.entries(snap.bots ?? {})
+        .filter(([, b]) => !b.health_only)
+        .map(([bot, b]) => ({
+          bot,
+          updated_at: b.status_file?.updated_at ?? null,
+          updated_today: !!b.status_file?.updated_today,
+          status: b.status_file?.parsed?.status ?? null,
+          next: b.status_file?.parsed?.next ?? null,
+          blockers: b.status_file?.parsed?.blockers ?? null,
+          needs: b.status_file?.parsed?.needs ?? [],
+          open: b.status_file?.parsed?.open ?? [],
+          morning: Array.isArray(b.morning) ? b.morning : [],
+        }))
+    : [];
+  const brief = snap?.brief ?? null;
+  let telegram = null;
+  try {
+    telegram = fs.readFileSync(path.join(support, "autoreviewer", "telegram-username"), "utf8").trim().replace(/^@/, "") || null;
+  } catch {
+    telegram = null;
+  }
+  return { generated_at: new Date(now).toISOString(), snapshot_at: snap?.generated_at ?? null, today: snap?.today ?? null, telegram, brief, directives, directiveBots: directiveBots(), work, grants, github, infra, cards };
+}
+
+// ── decisions from this page (operator, 2026-10-25) ──────────────────────────────
+// the operator: "browse and modify ... standing directives, and open permissions asks"
+// from the observatory. This page writes one decision file into a folder that
+// only the Mac and the autoreviewer container mount (TRUST MODEL item 9). The
+// autoreviewer stays the only ledger writer: it runs the same ledger call as
+// the Telegram button, edits the card and mails the bots
+// (autoreviewer/src/decisions.mjs). This server checks the shape only; the
+// ledger keeps every limit (24 h grants, 7 d directives, proposed-only decide).
+export const DECISION_DIR = process.env.OASIS_AUTOREVIEWER_DECISION_DIR || path.join(OASIS_SUPPORT, "autoreviewer-decisions");
+const DECIDE_PATH = "/api/approvals/decide";
+const DECIDE_WAIT_MS = 20_000;
+const GRANT_ID_RE = /^(?:GRANT|DIR)-\d{4,}$/;
+const GH_ID_RE = /^GH-\d{4,}$/;
+
+/** Check one decision and return the body for the autoreviewer, or { error }. */
+export function validateDecision(b) {
+  if (!b || typeof b !== "object" || Array.isArray(b)) return { error: "the body must be a JSON object" };
+  const str = (v, max) => typeof v === "string" && v.length <= max;
+  const hours = (v, max) => Number.isFinite(v) && v > 0 && v <= max;
+  switch (b.op) {
+    case "decide":
+      if (!GRANT_ID_RE.test(String(b.id ?? ""))) return { error: "id: GRANT-NNNN or DIR-NNNN" };
+      if (b.hours !== null && !hours(b.hours, 168)) return { error: "hours: null (deny) or 1-168" };
+      return { op: "decide", id: b.id, hours: b.hours };
+    case "revoke":
+      if (!GRANT_ID_RE.test(String(b.id ?? ""))) return { error: "id: GRANT-NNNN or DIR-NNNN" };
+      if (b.reason !== undefined && !str(b.reason, 200)) return { error: "reason: at most 200 characters" };
+      return { op: "revoke", id: b.id, reason: b.reason ?? "revoked from the observatory" };
+    case "renew":
+      if (!/^DIR-\d{4,}$/.test(String(b.id ?? ""))) return { error: "id: DIR-NNNN" };
+      if (!hours(b.hours, 168)) return { error: "hours: 1-168" };
+      return { op: "renew", id: b.id, hours: b.hours };
+    case "gh-decide":
+      if (!GH_ID_RE.test(String(b.id ?? ""))) return { error: "id: GH-NNNN" };
+      if (typeof b.approve !== "boolean") return { error: "approve: true or false" };
+      return { op: "gh-decide", id: b.id, approve: b.approve };
+    case "gh-revoke":
+      if (!GH_ID_RE.test(String(b.id ?? ""))) return { error: "id: GH-NNNN" };
+      return { op: "gh-revoke", id: b.id };
+    case "directive": {
+      if (!/^[a-z0-9-]{1,40}$/.test(String(b.bot ?? ""))) return { error: "bot: a bot key" };
+      if (!str(b.goal, 300) || !b.goal.trim()) return { error: "goal: 1-300 characters" };
+      const out = { op: "directive", bot: b.bot, goal: b.goal };
+      for (const [k, max] of [["may", 600], ["must_not", 600], ["lane", 80]]) {
+        if (b[k] === undefined || b[k] === "") continue;
+        if (!str(b[k], max)) return { error: `${k}: at most ${max} characters` };
+        out[k] = b[k];
+      }
+      if (b.ttl_hours !== undefined) {
+        if (!hours(b.ttl_hours, 168)) return { error: "ttl_hours: 1-168" };
+        out.ttl_hours = b.ttl_hours;
+      }
+      return out;
+    }
+    default:
+      return { error: "op: decide, revoke, renew, gh-decide, gh-revoke or directive" };
+  }
+}
+
+/** Write one decision for the autoreviewer and wait for its result. A decision
+ *  the autoreviewer has not picked up when the wait ends is taken back, so a
+ *  stopped autoreviewer cannot apply it hours later. */
+export async function submitDecision(body, { dir = DECISION_DIR, waitMs = DECIDE_WAIT_MS } = {}) {
+  const inbox = path.join(dir, "inbox");
+  const done = path.join(dir, "done");
+  fs.mkdirSync(inbox, { recursive: true, mode: 0o700 });
+  fs.mkdirSync(done, { recursive: true, mode: 0o700 });
+  const name = `${new Date().toISOString().replace(/[:.]/g, "-")}-${crypto.randomBytes(4).toString("hex")}.json`;
+  const tmp = path.join(inbox, `${name}.tmp`);
+  fs.writeFileSync(tmp, JSON.stringify(body), { mode: 0o600 });
+  fs.renameSync(tmp, path.join(inbox, name));
+  const result = path.join(done, name);
+  const deadline = Date.now() + waitMs;
+  for (;;) {
+    if (fs.existsSync(result)) {
+      const r = readJsonQuiet(result, { ok: false, error: "the autoreviewer wrote an unreadable result" });
+      fs.rmSync(result, { force: true });
+      return r;
+    }
+    if (Date.now() > deadline) {
+      try {
+        fs.rmSync(path.join(inbox, name));
+        return { ok: false, error: `the autoreviewer did not answer in ${Math.round(waitMs / 1000)} s; nothing was decided. Is oasis-autoreviewer running?` };
+      } catch {
+        // It took the file in the last moment: wait a little for the result.
+        if (Date.now() > deadline + 5000) return { ok: false, error: "the autoreviewer took the decision but wrote no result yet; check the Telegram card" };
+      }
+    }
+    await new Promise((r) => setTimeout(r, 250));
+  }
+}
+
+async function routeDecide(req, ctx) {
+  if (req.method !== "POST") return [405, { error: "method not allowed here" }];
+  let raw;
+  try {
+    raw = JSON.parse((await readBody(req, 8 * 1024)).toString("utf8"));
+  } catch (err) {
+    if (err.status) throw err;
+    return [400, { error: "the body is not valid JSON" }];
+  }
+  const body = validateDecision(raw);
+  if (body.error) return [400, body];
+  const result = await ctx.submitDecision(body);
+  ctx.cache.delete("approvals");
+  return [result.ok ? 200 : 409, result];
+}
+
+/** The bot names a directive may name: AUTOREVIEWER_BOTS in autoreviewer/.env. */
+function directiveBots() {
+  try {
+    const m = fs.readFileSync(path.join(SCRIPT_DIR, "..", "autoreviewer", ".env"), "utf8").match(/^AUTOREVIEWER_BOTS=(.*)$/m);
+    return m ? m[1].split(",").map((s) => s.trim()).filter((s) => /^[a-z0-9-]{1,40}$/.test(s)) : [];
+  } catch {
+    return [];
+  }
+}
+
+// ── cron jobs (operator, 2026-10-25) ─────────────────────────────────────────────
+// Browse and change each bot's openclaw cron jobs, and give a job its own model
+// apart from the bot's chat model (payload.model; openclaw applies it to
+// isolated agentTurn jobs only). Reads and writes go through the bot's own
+// `openclaw cron` CLI over `docker exec`, so openclaw keeps its validation and
+// its store. Arguments go as argv (no shell) in --flag=value form, so a value
+// that starts with "-" is never read as a flag. A mutating openclaw CLI call has
+// drifted openclaw.json before (scripts/claw-morning SAFETY): every write
+// fingerprints openclaw.json before and after and reports a change loudly.
+const CRON_PATH_RE = /^\/api\/cron(?:\/([a-z0-9-]{1,40})\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}))?$/;
+const isCronWrite = (method, pathname) => method === "POST" && CRON_PATH_RE.exec(pathname)?.[2] !== undefined;
+const THINKING = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "adaptive", "max"]);
+const CRON_EXPR_RE = /^[0-9A-Za-z*?/,#L-]+(?: [0-9A-Za-z*?/,#L-]+){4,5}$/;
+const TZ_RE = /^[A-Za-z_]+(?:\/[A-Za-z0-9_+-]+){0,2}$/;
+const EVERY_RE = /^\d{1,5}(?:s|m|h|d)$/;
+const CONTROL_CHARS_RE = /[\u0000-\u001f\u007f]/;
+
+/** The model settings and tool policy in openclaw.json, and a fingerprint of
+ *  the whole file (FNV-1a; collectors have no crypto module). */
+export function collectAgentConfig(fs, path, home) {
+  const p = path.join(home, "openclaw.json");
+  let text = "";
+  try {
+    const st = fs.lstatSync(p);
+    if (st.isFile() && st.size <= 4 * 1024 * 1024) text = fs.readFileSync(p, "utf8");
+  } catch {
+    return { error: "openclaw.json is missing" };
+  }
+  let h = 0x811c9dc5;
+  for (let i = 0; i < text.length; i++) {
+    h ^= text.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  let c = {};
+  try {
+    c = JSON.parse(text);
+  } catch {
+    return { fingerprint: `${text.length}:${h}`, error: "openclaw.json is not valid JSON" };
+  }
+  const d = c?.agents?.defaults ?? {};
+  const list = (v) => (Array.isArray(v) ? v.filter((x) => typeof x === "string") : []);
+  const plugins = c?.plugins?.entries ?? {};
+  return {
+    fingerprint: `${text.length}:${h}`,
+    model: {
+      primary: typeof d.model === "string" ? d.model : (d.model?.primary ?? null),
+      fallbacks: list(d.model?.fallbacks),
+      subagents: typeof d.subagents?.model === "string" ? d.subagents.model : (d.subagents?.model?.primary ?? null),
+      allowed: Object.keys(d.models ?? {}).sort(),
+    },
+    tools: {
+      profile: c?.tools?.profile ?? null,
+      allow: list(c?.tools?.allow),
+      alsoAllow: list(c?.tools?.alsoAllow),
+      deny: list(c?.tools?.deny),
+      plugins: Object.entries(plugins)
+        .map(([id, e]) => ({ id, enabled: e?.enabled !== false }))
+        .sort((a, b) => a.id.localeCompare(b.id)),
+    },
+  };
+}
+
+/** The JSON object an openclaw CLI printed, after any warning lines. */
+export function parseCliJson(out) {
+  const text = String(out);
+  const at = text.search(/^[{[]/m);
+  if (at < 0) throw new Error("the openclaw CLI printed no JSON");
+  return JSON.parse(text.slice(at));
+}
+
+const capText = (v, n) => (typeof v === "string" ? (v.length > n ? `${v.slice(0, n)}…` : v) : null);
+
+/** The fields of a cron job this page shows. */
+export function pickCronJob(j) {
+  const s = j?.state ?? {};
+  const p = j?.payload ?? {};
+  return {
+    id: j.id,
+    name: capText(j.name, 200),
+    description: capText(j.description, 500),
+    declarationKey: j.declarationKey ?? null,
+    enabled: j.enabled !== false,
+    agentId: j.agentId ?? null,
+    schedule: j.schedule ?? null,
+    sessionTarget: j.sessionTarget ?? null,
+    payload: {
+      kind: p.kind ?? null,
+      text: capText(p.kind === "systemEvent" ? p.text : p.message, 8000),
+      model: p.model ?? null,
+      thinking: p.thinking ?? null,
+      timeoutSeconds: p.timeoutSeconds ?? null,
+    },
+    delivery: j.delivery ? { mode: j.delivery.mode ?? null, channel: j.delivery.channel ?? null } : null,
+    state: {
+      nextRunAtMs: s.nextRunAtMs ?? null,
+      lastRunAtMs: s.lastRunAtMs ?? null,
+      lastRunStatus: s.lastRunStatus ?? s.lastStatus ?? null,
+      lastDurationMs: s.lastDurationMs ?? null,
+      consecutiveErrors: s.consecutiveErrors ?? 0,
+      lastError: capText(s.lastError, 500),
+    },
+  };
+}
+
+/** Turn a checked patch into `openclaw cron edit` flags. Returns { args } or { error }. */
+export function cronEditArgs(job, patch, allowedModels) {
+  if (!patch || typeof patch !== "object" || Array.isArray(patch)) return { error: "patch must be an object" };
+  const args = [];
+  const agentTurn = job.payload?.kind === "agentTurn";
+  for (const key of Object.keys(patch)) {
+    const v = patch[key];
+    switch (key) {
+      case "enabled":
+        if (typeof v !== "boolean") return { error: "enabled: true or false" };
+        args.push(v ? "--enable" : "--disable");
+        break;
+      case "model":
+        if (!agentTurn) return { error: "this job runs in the main session, which uses the bot's chat model: it takes no model of its own" };
+        if (v === null || v === "") args.push("--clear-model");
+        else if (typeof v === "string" && allowedModels.includes(v)) args.push(`--model=${v}`);
+        else return { error: `model: not in this bot's allowed models (agents.defaults.models)` };
+        break;
+      case "thinking":
+        if (!agentTurn) return { error: "thinking applies to isolated agent jobs only" };
+        if (v === null || v === "") args.push("--clear-thinking");
+        else if (THINKING.has(v)) args.push(`--thinking=${v}`);
+        else return { error: `thinking: one of ${[...THINKING].join(", ")}` };
+        break;
+      case "name":
+        if (typeof v !== "string" || !v.trim() || v.length > 120 || CONTROL_CHARS_RE.test(v)) return { error: "name: 1-120 characters, one line" };
+        args.push(`--name=${v.trim()}`);
+        break;
+      case "text":
+        if (typeof v !== "string" || !v.trim() || v.length > 8000) return { error: "text: 1-8000 characters" };
+        if (job.payload?.kind === "agentTurn") args.push(`--message=${v}`);
+        else if (job.payload?.kind === "systemEvent") args.push(`--system-event=${v}`);
+        else return { error: `a ${job.payload?.kind ?? "unknown"} payload cannot be edited here` };
+        break;
+      case "schedule": {
+        if (!v || typeof v !== "object") return { error: "schedule must be an object" };
+        if (v.kind === "cron") {
+          if (!CRON_EXPR_RE.test(String(v.expr ?? ""))) return { error: "schedule.expr: a 5- or 6-field cron expression" };
+          args.push(`--cron=${v.expr}`);
+          if (v.tz !== undefined && v.tz !== "") {
+            if (!TZ_RE.test(String(v.tz))) return { error: "schedule.tz: an IANA time zone such as America/New_York" };
+            args.push(`--tz=${v.tz}`);
+          }
+        } else if (v.kind === "every") {
+          if (!EVERY_RE.test(String(v.every ?? ""))) return { error: "schedule.every: a duration such as 30m, 6h or 2d" };
+          args.push(`--every=${v.every}`);
+        } else if (v.kind === "at") {
+          if (!Number.isFinite(Date.parse(v.at)) || !/^\d{4}-\d{2}-\d{2}T[\d:.]+(?:Z|[+-]\d{2}:\d{2})$/.test(String(v.at))) return { error: "schedule.at: an ISO time with a zone" };
+          args.push(`--at=${v.at}`);
+        } else {
+          return { error: "schedule.kind: cron, every or at" };
+        }
+        break;
+      }
+      default:
+        return { error: `unknown field ${key}` };
+    }
+  }
+  if (!args.length) return { error: "nothing to change" };
+  return { args };
+}
+
+async function readCronBot(ctx, bot) {
+  const [config, list] = await Promise.all([
+    cached(ctx, `agentcfg:${bot.key}`, 15_000, () => ctx.readAgentConfig(bot)),
+    cached(ctx, `cron:${bot.key}`, 15_000, () => ctx.cronCli(bot, ["list", "--all", "--json"]).then(parseCliJson)),
+  ]);
+  return {
+    key: bot.key,
+    model: config.model ?? null,
+    jobs: (list.jobs ?? []).map(pickCronJob),
+  };
+}
+
+/** /api/cron              GET   every running bot's jobs, chat model and allowed models
+ *  /api/cron/<bot>/<id>   POST  { action: "edit", patch } | { action: "run" } | { action: "remove" } */
+async function routeCron(req, url, ctx) {
+  const [, key, id] = CRON_PATH_RE.exec(url.pathname) ?? [];
+  const fleet = await cached(ctx, "fleet", 4000, ctx.discover);
+  if (!key) {
+    if (req.method !== "GET") return [405, { error: "method not allowed here" }];
+    const bots = await Promise.all(
+      fleet.bots.map(async (bot) => {
+        if (!bot.running) return { key: bot.key, error: `${bot.container} is ${bot.state}` };
+        try {
+          return await readCronBot(ctx, bot);
+        } catch (err) {
+          return { key: bot.key, error: err.message };
+        }
+      }),
+    );
+    return [200, { bots }];
+  }
+  if (req.method !== "POST") return [405, { error: "method not allowed here" }];
+  const bot = fleet.bots.find((b) => b.key === key);
+  if (!bot) return [404, { error: `unknown bot "${key}"` }];
+  if (!bot.running) return [409, { error: `${bot.container} is ${bot.state}` }];
+  let body;
+  try {
+    body = JSON.parse((await readBody(req, 32 * 1024)).toString("utf8"));
+  } catch (err) {
+    if (err.status) throw err;
+    return [400, { error: "the body is not valid JSON" }];
+  }
+  ctx.cache.delete(`cron:${bot.key}`);
+  ctx.cache.delete(`agentcfg:${bot.key}`);
+  const current = await readCronBot(ctx, bot);
+  const job = current.jobs.find((j) => j.id === id);
+  if (!job) return [404, { error: `no cron job ${id} on ${bot.key}` }];
+  let args;
+  if (body?.action === "edit") {
+    const r = cronEditArgs(job, body.patch, current.model?.allowed ?? []);
+    if (r.error) return [400, { error: r.error }];
+    args = ["edit", id, ...r.args];
+  } else if (body?.action === "run") {
+    args = ["run", id];
+  } else if (body?.action === "remove") {
+    args = ["rm", id];
+  } else {
+    return [400, { error: "action: edit, run or remove" }];
+  }
+  const before = (await ctx.readAgentConfig(bot)).fingerprint;
+  let out;
+  try {
+    out = await ctx.cronCli(bot, args);
+  } finally {
+    ctx.cache.delete(`cron:${bot.key}`);
+    ctx.cache.delete(`agentcfg:${bot.key}`);
+  }
+  const after = (await ctx.readAgentConfig(bot)).fingerprint;
+  if (before !== after) {
+    return [500, { error: `${bot.key}: openclaw.json CHANGED during \`openclaw cron ${args[0]}\`. The change was applied; check the bot's config and its next Telegram turn.` }];
+  }
+  const fresh = await readCronBot(ctx, bot);
+  return [200, { ok: true, output: capText(String(out).trim(), 2000), job: fresh.jobs.find((j) => j.id === id) ?? null }];
+}
+
+// ── egress list and tools (operator, 2026-10-25) ─────────────────────────────────
+// Read only. The egress proxy's lists are host files (sandbox/egress-proxy);
+// what a bot really reached is in the proxy's audit file, a volume that only
+// the vetting container mounts, so the observatory reads its tail there.
+// Changes to egress still go through scripts/claw-vet.
+const EGRESS_DIR = process.env.OASIS_EGRESS_DIR || path.join(SCRIPT_DIR, "..", "sandbox", "egress-proxy");
+const EGRESS_BOTS_FILE = process.env.OASIS_EGRESS_BOTS_FILE || path.join(OASIS_SUPPORT, "egress", "bots.json");
+const EGRESS_AUDIT_CONTAINER = "oasis-claw-vet";
+const EGRESS_AUDIT_FILE = "/var/lib/egress/audit/audit.jsonl";
+
+function readListFile(file) {
+  try {
+    return fs
+      .readFileSync(file, "utf8")
+      .split("\n")
+      .map((l) => l.trim())
+      .filter((l) => l && !l.startsWith("#"));
+  } catch {
+    return [];
+  }
+}
+
+function readJsonlTail(file, max) {
+  try {
+    return fs
+      .readFileSync(file, "utf8")
+      .split("\n")
+      .filter(Boolean)
+      .slice(-max * 4)
+      .map((l) => {
+        try {
+          return JSON.parse(l);
+        } catch {
+          return null;
+        }
+      })
+      .filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+/** Per-host counts for one bot from the proxy's audit rows. */
+export function egressActivity(rows, bot, now = Date.now()) {
+  const byHost = new Map();
+  for (const r of rows) {
+    if (r?.event !== "decision" || r.bot !== bot || typeof r.host !== "string") continue;
+    const ts = Number(r.ts_unix) * 1000;
+    const e = byHost.get(r.host) ?? { host: r.host, allow: 0, deny: 0, last: 0 };
+    if (r.action === "allow") e.allow++;
+    else e.deny++;
+    e.last = Math.max(e.last, Number.isFinite(ts) ? ts : 0);
+    byHost.set(r.host, e);
+  }
+  return [...byHost.values()].filter((e) => now - e.last <= 7 * 86_400_000).sort((a, b) => b.last - a.last).slice(0, 100);
+}
+
+export function readEgress(bot, auditRows, { dir = EGRESS_DIR, botsFile = EGRESS_BOTS_FILE, baseEnv = [] } = {}) {
+  const partitioned = readJsonQuiet(botsFile, []);
+  const decision = (r) => ({ ts: r.ts ?? null, host: r.host ?? null, decision: r.decision ?? null, reason: capText(r.reason, 200), source: r.source ?? null });
+  const learnedRows = [
+    ...readJsonlTail(path.join(dir, "learned", bot, "learned.jsonl"), 40),
+    ...readJsonlTail(path.join(dir, "learned", "learned.jsonl"), 200).filter((r) => r.bot === bot),
+  ]
+    .sort((a, b) => String(b.ts).localeCompare(String(a.ts)))
+    .slice(0, 40)
+    .map(decision);
+  return {
+    behindProxy: Array.isArray(partitioned) && partitioned.includes(bot),
+    base: [...new Set([...readListFile(path.join(dir, "allowlist.txt")), ...baseEnv])],
+    learnedShared: readListFile(path.join(dir, "learned", "allowlist.txt")),
+    learnedBot: readListFile(path.join(dir, "learned", bot, "allowlist.txt")),
+    decisions: learnedRows,
+    activity: auditRows ? egressActivity(auditRows, bot) : null,
+  };
+}
+
+async function readEgressAudit() {
+  const out = await docker(["exec", EGRESS_AUDIT_CONTAINER, "tail", "-c", "4000000", EGRESS_AUDIT_FILE], { timeoutMs: 20_000 });
+  return out
+    .split("\n")
+    .map((l) => {
+      try {
+        return JSON.parse(l);
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean);
+}
+
+async function readProxyAllowlistEnv() {
+  const out = await docker(["inspect", "oasis-egress-proxy", "--format", "{{json .Config.Env}}"], { timeoutMs: 10_000 });
+  const line = JSON.parse(out).find((e) => e.startsWith("ALLOWLIST=")) ?? "";
+  return line.slice("ALLOWLIST=".length).split(/[\s,]+/).filter(Boolean);
+}
+
+/** The tools the bot's main agent can call now, from its gateway (tools.effective). */
+export function pickEffectiveTools(r) {
+  return {
+    profile: r?.profile ?? null,
+    groups: (r?.groups ?? []).map((g) => ({
+      id: g.id,
+      label: g.label ?? g.id,
+      source: g.source ?? null,
+      tools: (g.tools ?? []).map((t) => ({ id: t.id, label: t.label ?? t.id, description: capText(t.description, 300), source: t.source ?? null })),
+    })),
+  };
+}
+
+// ── fleet health: start and restart containers (operator, 2026-10-26) ────────────
+// After a Mac out-of-memory event, some bots and services stayed down
+// (killed from outside Docker, exit 137, so `restart: unless-stopped` did not
+// bring them back). The operator: "restart the fleet where necessary ... nice to be
+// able to do from the desktop app". This lists the fleet's containers and
+// runs `docker start` or `docker restart` on one of them: the container keeps
+// its config, as after a crash. A recreate (new .env, new image) stays a
+// compose job in bots/Makefile. Only names on FLEET_SERVICES or with the bot
+// prefix are touched, and never one the exclude pattern hides (TRUST MODEL
+// item 11). "Start all that are down" starts the shared services first, then
+// the autoreviewer, then each bot, and waits for each to be healthy.
+const FLEET_SERVICES = [
+  // In start order: what the bots need first.
+  "oasis-egress-proxy",
+  "oasis-semantics",
+  "oasis-voice",
+  "oasis-decider",
+  "claw-mail-relay",
+  PROXY_CONTAINER,
+  "oasis-claw-vet",
+  "oasis-claw-vandeneb-sandbox",
+  "oasis-autoreviewer",
+];
+const FLEET_PATH_RE = /^\/api\/fleet\/(containers|recover)(?:\/([a-z0-9][a-z0-9_.-]{0,80})\/(start|restart))?$/;
+const isFleetWrite = (method, pathname) => {
+  const m = FLEET_PATH_RE.exec(pathname);
+  return method === "POST" && !!m && (m[1] === "recover" ? !m[2] : !!m[2]);
+};
+const FLEET_WAIT_MS = 180_000;
+
+export function isFleetContainer(name, exclude = EXCLUDE_RE) {
+  if (exclude?.test(name)) return false;
+  return FLEET_SERVICES.includes(name) || name.startsWith(CONTAINER_PREFIX);
+}
+
+/** Start order: services in FLEET_SERVICES order, then bots (Orion's runtime first). */
+export function fleetOrder(names) {
+  const rank = (n) => {
+    const i = FLEET_SERVICES.indexOf(n);
+    if (i >= 0) return i;
+    return FLEET_SERVICES.length + (n === `${CONTAINER_PREFIX}runtime` ? 0 : 1);
+  };
+  return [...names].sort((a, b) => rank(a) - rank(b) || a.localeCompare(b));
+}
+
+export function parseFleetRows(out, exclude = EXCLUDE_RE) {
+  const rows = out
+    .split("\n")
+    .map((line) => {
+      const [name, state, status] = line.split("\t");
+      return { name, state, status, health: parseHealth(status) };
+    })
+    .filter((r) => r.name && isFleetContainer(r.name, exclude));
+  const order = fleetOrder(rows.map((r) => r.name));
+  return order.map((n) => {
+    const r = rows.find((x) => x.name === n);
+    return { ...r, kind: FLEET_SERVICES.includes(n) ? "service" : "bot", down: r.state !== "running" };
+  });
+}
+
+async function listFleetContainers() {
+  return parseFleetRows(await docker(["ps", "-a", "--format", "{{.Names}}\t{{.State}}\t{{.Status}}"]));
+}
+
+/** Wait until a started container is healthy (or running, with no health check). */
+async function waitReady(ctx, name, waitMs = FLEET_WAIT_MS) {
+  const deadline = Date.now() + waitMs;
+  for (;;) {
+    const row = (await ctx.listFleet()).find((r) => r.name === name);
+    if (!row) return { ok: false, detail: "gone" };
+    if (row.state === "running" && (row.health === null || row.health === "healthy")) return { ok: true, detail: row.health ?? "running" };
+    if (row.state !== "running" && row.state !== "restarting") return { ok: false, detail: row.state };
+    if (Date.now() > deadline) return { ok: false, detail: `not healthy after ${Math.round(waitMs / 1000)} s (${row.health ?? row.state})` };
+    await new Promise((r) => setTimeout(r, ctx.fleetPollMs ?? 3000));
+  }
+}
+
+/** Start every fleet container that is down, in order, one at a time. */
+async function runRecover(ctx, job) {
+  const down = (await ctx.listFleet()).filter((r) => r.down);
+  job.steps = down.map((r) => ({ name: r.name, kind: r.kind, status: "waiting", detail: r.status }));
+  for (const step of job.steps) {
+    step.status = "starting";
+    try {
+      await ctx.dockerCtl("start", step.name);
+      const ready = await waitReady(ctx, step.name);
+      step.status = ready.ok ? "ok" : "failed";
+      step.detail = ready.detail;
+    } catch (err) {
+      step.status = "failed";
+      step.detail = err.message;
+    }
+    ctx.cache.delete("fleet");
+  }
+  job.done = true;
+  job.finishedAt = Date.now();
+}
+
+/** /api/fleet/containers                 GET   the fleet's containers, with state and health
+ *  /api/fleet/containers/<name>/start    POST  docker start
+ *  /api/fleet/containers/<name>/restart  POST  docker restart
+ *  /api/fleet/recover                    GET   the last "start all that are down" job
+ *                                        POST  start one (409 while one runs) */
+async function routeFleet(req, url, ctx) {
+  const [, what, name, action] = FLEET_PATH_RE.exec(url.pathname) ?? [];
+  if (what === "containers" && !name) {
+    if (req.method !== "GET") return [405, { error: "method not allowed here" }];
+    return [200, { containers: await ctx.listFleet(), recover: ctx.recoverJob ?? null }];
+  }
+  if (what === "containers") {
+    if (req.method !== "POST") return [405, { error: "method not allowed here" }];
+    const row = (await ctx.listFleet()).find((r) => r.name === name);
+    if (!row) return [404, { error: `${name} is not a fleet container` }];
+    if (ctx.recoverJob && !ctx.recoverJob.done) return [409, { error: "a start-all job is running; wait for it" }];
+    await ctx.dockerCtl(action, name);
+    ctx.cache.delete("fleet");
+    const ready = await waitReady(ctx, name, 120_000);
+    return [ready.ok ? 200 : 502, { name, action, ...ready }];
+  }
+  if (what === "recover" && !name) {
+    if (req.method === "GET") return [200, { job: ctx.recoverJob ?? null }];
+    if (req.method !== "POST") return [405, { error: "method not allowed here" }];
+    if (ctx.recoverJob && !ctx.recoverJob.done) return [409, { error: "a start-all job is already running", job: ctx.recoverJob }];
+    const job = { startedAt: Date.now(), done: false, steps: [] };
+    ctx.recoverJob = job;
+    runRecover(ctx, job).catch((err) => {
+      job.done = true;
+      job.error = err.message;
+    });
+    return [202, { job }];
+  }
+  return [404, { error: "not found" }];
+}
+
+async function routeApi(url, ctx) {
+  const parts = url.pathname.split("/").filter(Boolean);
+  const fleet = () => cached(ctx, "fleet", 4000, ctx.discover);
+
+  if (parts.length === 2 && parts[1] === "fleet") {
+    const [f, swarmUp, snapshot] = await Promise.all([
+      fleet(),
+      cached(ctx, "swarm-up", 5000, () => httpReachable(ctx.swarm.url)),
+      cached(ctx, "snapshot-last", 30_000, () => lastSnapshotCommit(ctx.snapshotDir)),
+    ]);
+    for (const b of f.bots) maybeRefreshIdentity(ctx, b);
+    const withUrls = withOpenUrls(f, ctx.proxyKey());
+    return [
+      200,
+      {
+        ...withUrls,
+        bots: withUrls.bots.map((b) => ({ ...b, identity: publicIdentity(ctx, b) })),
+        families: [...ROLE_FAMILIES.map(({ id, label }) => ({ id, label })), OTHER_FAMILY],
+        swarm: { ...ctx.swarm, running: swarmUp },
+        feedback: { defaultTo: ctx.feedbackTo },
+        snapshot: { dir: ctx.snapshotDir, last: snapshot },
+      },
+    ];
+  }
+
+  if (parts.length === 2 && parts[1] === "approvals") {
+    return [200, await cached(ctx, "approvals", 5000, async () => readApprovals())];
+  }
+
+  if (parts.length === 2 && parts[1] === "colony") {
+    const raw = await cached(ctx, "colony", 60_000, () => ctx.readColony());
+    return [
+      200,
+      {
+        url: ctx.swarm.url,
+        root: raw.root ?? null,
+        timestamp: raw.timestamp ?? null,
+        divisions: (raw.divisions ?? []).map((d) => ({
+          name: d.name ?? null,
+          path: d.path ?? null,
+          error: d.error ?? null,
+          active: d.queue?.active?.length ?? 0,
+          pending: d.queue?.pending?.length ?? 0,
+          done: d.queue?.done?.length ?? 0,
+          items: [...(d.queue?.active ?? []), ...(d.queue?.pending ?? [])].slice(0, 40).map(pickItem),
+        })),
+      },
+    ];
+  }
+
+  if (parts.length === 2 && parts[1] === "boards") {
+    const f = await fleet();
+    const boards = f.bots
+      .filter((b) => b.board?.hostPath)
+      .map((b) => ({ key: b.key, container: b.container, hostPath: b.board.hostPath, summary: boardSummary(b.board.hostPath) }));
+    return [200, { boards }];
+  }
+
+  if (parts.length === 4 && parts[1] === "bots") {
+    const f = await fleet();
+    const bot = f.bots.find((b) => b.key === parts[2]);
+    if (!bot) return [404, { error: "unknown bot" }];
+    const needsContainer = ["profile", "sessions", "transcript", "tools"].includes(parts[3]);
+    if (needsContainer && !bot.running) return [409, { error: `${bot.container} is ${bot.state}` }];
+
+    switch (parts[3]) {
+      case "profile": {
+        const profile = await cached(ctx, `profile:${bot.key}`, 60_000, () => collect(bot.container, collectProfile));
+        return [
+          200,
+          {
+            bot,
+            profile,
+            mail: bot.mailbox ? mailSummary(ctx.mailRoot, bot.mailbox) : null,
+            board: bot.board?.hostPath ? { hostPath: bot.board.hostPath, summary: boardSummary(bot.board.hostPath) } : null,
+          },
+        ];
+      }
+      case "sessions":
+        return [200, await cached(ctx, `sessions:${bot.key}`, 5000, () => collect(bot.container, collectSessions))];
+      case "transcript": {
+        const agent = url.searchParams.get("agent") || "main";
+        const session = url.searchParams.get("session") || "";
+        const limit = url.searchParams.get("limit") || "150";
+        if (!/^[A-Za-z0-9_-]{1,64}$/.test(agent) || !/^[0-9a-f-]{8,64}$/i.test(session) || !/^\d{1,3}$/.test(limit)) {
+          return [400, { error: "invalid agent, session or limit" }];
+        }
+        const result = await cached(ctx, `transcript:${bot.key}:${agent}:${session}:${limit}`, 2500, () =>
+          collect(bot.container, collectTranscript, [agent, session, limit]),
+        );
+        return [result.error ? 404 : 200, result];
+      }
+      case "tools": {
+        const [config, effective] = await Promise.all([
+          cached(ctx, `agentcfg:${bot.key}`, 15_000, () => ctx.readAgentConfig(bot)),
+          cached(ctx, `tools:${bot.key}`, 300_000, () => ctx.readEffectiveTools(bot)).then(
+            (r) => ({ ...pickEffectiveTools(r), error: null }),
+            (err) => ({ profile: null, groups: [], error: err.message }),
+          ),
+        ]);
+        return [200, { config: config.tools ?? null, model: config.model ?? null, effective }];
+      }
+      case "egress": {
+        const [audit, baseEnv] = await Promise.all([
+          cached(ctx, "egress-audit", 30_000, () => ctx.readEgressAudit()).catch(() => null),
+          cached(ctx, "egress-env", 300_000, () => ctx.readProxyAllowlistEnv()).catch(() => []),
+        ]);
+        return [200, { ...ctx.readEgress(bot.key, audit, { baseEnv }), auditRead: audit !== null }];
+      }
+      case "history":
+        return [200, await botHistory(ctx.snapshotDir, bot.key)];
+      case "diff": {
+        const result = await botDiff(ctx.snapshotDir, bot.key, url.searchParams.get("commit"), url.searchParams.get("file"));
+        return [result.error ? 400 : 200, result];
+      }
+      default:
+        return [404, { error: "not found" }];
+    }
+  }
+  return [404, { error: "not found" }];
+}
+
+let pageIcon = null;
+
+export function createObservatoryServer(ctx) {
+  ctx.cache ??= new Map();
+  ctx.discover ??= discoverFleet;
+  ctx.mailRoot ??= MAIL_ROOT;
+  ctx.snapshotDir ??= DEFAULT_SNAPSHOT_DIR;
+  ctx.proxyKey ??= () => ensureProxyKey();
+  ctx.pairingArmed ??= new Map();
+  ctx.readGatewayToken ??= (bot) => collect(bot.container, collectGatewayToken);
+  ctx.readPendingPairing ??= (bot) => collect(bot.container, collectPendingPairing);
+  ctx.approveDevice ??= (container, requestId) =>
+    docker(["exec", container, "openclaw", "devices", "approve", requestId, "--json"], { timeoutMs: 30_000 });
+  ctx.feedbackStore ??= lazyFeedbackStore();
+  ctx.feedbackTo ??= DEFAULT_FEEDBACK_TO;
+  ctx.sendMail ??= (mail) => queueConsoleMail(ctx.mailRoot, mail);
+  ctx.identities ??= identityStore(IDENTITY_DIR);
+  ctx.identityRefreshing ??= new Set();
+  ctx.readIdentity ??= (bot) => collect(bot.container, collectIdentity);
+  ctx.readColony ??= () => readColony(ctx.swarm.root);
+  ctx.settings ??= settingsStore(SETTINGS_FILE);
+  ctx.readUserMd ??= (bot) => collect(bot.container, collectUserMd, ["read"]);
+  ctx.writeUserMd ??= (bot, baseHash, text) =>
+    collect(bot.container, collectUserMd, ["write", baseHash, Buffer.from(text, "utf8").toString("base64")]);
+  ctx.keepUserMdHistory ??= (key, text) => keepUserMdHistory(USER_MD_HISTORY_DIR, key, text);
+  ctx.genAdmin ??= (method, apiPath, body) => genAdmin(method, apiPath, body);
+  ctx.submitDecision ??= (body) => submitDecision(body);
+  ctx.readAgentConfig ??= (bot) => collect(bot.container, collectAgentConfig);
+  ctx.cronCli ??= (bot, args) => docker(["exec", bot.container, "openclaw", "cron", ...args], { timeoutMs: 90_000 });
+  ctx.readEffectiveTools ??= (bot) =>
+    docker(
+      ["exec", bot.container, "openclaw", "gateway", "call", "tools.effective", "--params", JSON.stringify({ agentId: "main", sessionKey: "agent:main:main" }), "--json"],
+      { timeoutMs: 60_000 },
+    ).then(parseCliJson);
+  ctx.readEgress ??= readEgress;
+  ctx.listFleet ??= listFleetContainers;
+  ctx.dockerCtl ??= (action, name) => docker([action, name], { timeoutMs: 120_000 });
+  ctx.readEgressAudit ??= readEgressAudit;
+  ctx.readProxyAllowlistEnv ??= readProxyAllowlistEnv;
+  ctx.readIdentityMd ??= async (bot) => collect(bot.container, (await loadStudio()).collectIdentityMd, ["read"]);
+  ctx.writeIdentityMd ??= async (bot, baseHash, text) =>
+    collect(bot.container, (await loadStudio()).collectIdentityMd, ["write", baseHash, Buffer.from(text, "utf8").toString("base64")]);
+  ctx.keepIdentityMdHistory ??= (key, text) => keepUserMdHistory(IDENTITY_MD_HISTORY_DIR, key, text);
+  ctx.readIdentityConfig ??= async (bot) => collect(bot.container, (await loadStudio()).collectIdentityConfig);
+  ctx.writeAvatar ??= async (bot, name, bytes) =>
+    JSON.parse(
+      await docker(["exec", "-i", bot.container, "node", "-e", collectorScript((await loadStudio()).collectAvatarWrite), name, "-"], {
+        timeoutMs: 60_000,
+        input: bytes,
+      }),
+    );
+  ctx.setIdentityAvatar ??= (bot, rel) =>
+    docker(["exec", bot.container, "openclaw", "agents", "set-identity", "--agent", "main", "--avatar", rel, "--json"], { timeoutMs: 60_000 }).then(parseCliJson);
+  ctx.genModels ??= async () => (await loadStudio()).genModels({ url: GEN_ADMIN_URL, tokenFile: GEN_KEY_FILE });
+  ctx.genChat ??= async (opts) => (await loadStudio()).genChat({ url: GEN_ADMIN_URL, tokenFile: GEN_KEY_FILE, ...opts });
+  ctx.genKeyReady ??= () => fs.existsSync(GEN_KEY_FILE);
+  ctx.inspectFor ??= cachedInspect;
+  ctx.readAccessConfig ??= async (bot) => collect(bot.container, (await loadAccess()).collectAccessConfig);
+  ctx.readRoleDeclared ??= async (bot) =>
+    JSON.parse(await docker(["exec", bot.container, "python3", "-c", (await loadAccess()).ROLE_PY, (await loadAccess()).ROLE_MOUNT], { timeoutMs: 30_000 }));
+  ctx.readPolicy ??= async (file) => (await loadAccess()).readPolicyFile(file);
+  ctx.authorityDir ??= process.env.OASIS_AUTHORITY_DIR || path.join(STATE_DIR, "authority");
+  ctx.authorityViewDir ??= process.env.OASIS_AUTHORITY_VIEW_DIR || path.join(OASIS_SUPPORT, "authority-view");
+  ctx.authorityPlist ??= path.join(HOME, "Library", "LaunchAgents", "com.oasis-x.authority.plist");
+  ctx.readReviewerHealth ??= async (bot) => collect(bot.container, (await loadAuthorityView()).collectReviewerHealth);
+  ctx.rootSigner ??= async (dir) => (await loadAuthorityView()).rootSignerFor(dir);
+  ctx.repoRoot ??= REPO_ROOT;
+  ctx.accessHistoryDir ??= ACCESS_HISTORY_DIR;
+  ctx.parseRoleInBot ??= async (container, text) => (await loadAccessEdit()).parseRoleInBot(container, text);
+  return http.createServer((req, res) => {
+    const refused = checkRequest(req, ctx.port);
+    if (refused) {
+      sendJson(res, refused.status, { error: refused.error });
+      return;
+    }
+    const url = new URL(req.url, `http://127.0.0.1:${ctx.port}`);
+    const asset = ASSETS[url.pathname];
+    if (asset) {
+      fs.readFile(path.join(ctx.assetDir ?? ASSET_DIR, asset[0]), (err, body) => {
+        if (err) send(res, 500, "asset missing", "text/plain; charset=utf-8");
+        else send(res, 200, body, asset[1]);
+      });
+      return;
+    }
+    if (url.pathname === "/icon.png") {
+      pageIcon ??= renderIcon(512);
+      res.writeHead(200, { ...SECURITY_HEADERS, "cache-control": "public, max-age=86400", "content-type": "image/png" });
+      res.end(pageIcon);
+      return;
+    }
+    if (url.pathname === "/manifest.webmanifest") {
+      send(res, 200, MANIFEST, "application/manifest+json");
+      return;
+    }
+    if (!url.pathname.startsWith("/api/")) {
+      sendJson(res, 404, { error: "not found" });
+      return;
+    }
+    if (!tokenMatches(req, ctx.token)) {
+      sendJson(res, 401, { error: "this browser has no valid access key: run `make observe-open` once" });
+      return;
+    }
+    const avatarMatch = url.pathname.match(/^\/api\/bots\/([a-z0-9-]{1,40})\/avatar$/);
+    if (avatarMatch) {
+      const avatar = ctx.identities.get(avatarMatch[1])?.avatar;
+      if (!avatar) {
+        sendJson(res, 404, { error: "no avatar" });
+        return;
+      }
+      // The URL carries the image version, so the browser may keep it.
+      res.writeHead(200, { ...SECURITY_HEADERS, "cache-control": "private, max-age=86400", "content-type": avatar.mime });
+      res.end(avatar.bytes);
+      return;
+    }
+    if (isFeedbackPath(url.pathname)) {
+      routeFeedback(req, url, ctx).then(
+        ([status, body]) => {
+          if (body === null) {
+            res.writeHead(status, SECURITY_HEADERS);
+            res.end();
+          } else {
+            sendJson(res, status, body);
+          }
+        },
+        (err) => {
+          // Stop reading a body that was refused part-way.
+          if (err.status === 413) res.once("finish", () => req.destroy());
+          sendJson(res, err.status ?? 500, { error: err.message });
+        },
+      );
+      return;
+    }
+    if (url.pathname === "/api/operator" && req.method === "GET") {
+      sendJson(res, 200, { name: operatorName() });
+      return;
+    }
+    if (SETTINGS_PATH_RE.test(url.pathname) || USER_MD_PATH_RE.test(url.pathname)) {
+      routeSettings(req, url, ctx).then(
+        ([status, body]) => sendJson(res, status, body),
+        (err) => {
+          if (err.status === 413) res.once("finish", () => req.destroy());
+          sendJson(res, err.status ?? 502, { error: err.message });
+        },
+      );
+      return;
+    }
+    if (GENROUTE_PATH_RE.test(url.pathname)) {
+      routeGenroute(req, url, ctx).then(
+        ([status, body]) => sendJson(res, status, body),
+        (err) => sendJson(res, err.status ?? 502, { error: err.message }),
+      );
+      return;
+    }
+    if (FLEET_PATH_RE.test(url.pathname)) {
+      routeFleet(req, url, ctx).then(
+        ([status, body]) => sendJson(res, status, body),
+        (err) => sendJson(res, err.status ?? 502, { error: err.message }),
+      );
+      return;
+    }
+    if (BOARD_ITEM_PATH_RE.test(url.pathname)) {
+      routeBoardItem(req, url, ctx).then(
+        ([status, body]) => sendJson(res, status, body),
+        (err) => {
+          if (err.status === 413) res.once("finish", () => req.destroy());
+          sendJson(res, err.status ?? 502, { error: err.message });
+        },
+      );
+      return;
+    }
+    if (CRON_PATH_RE.test(url.pathname) || url.pathname === DECIDE_PATH) {
+      (url.pathname === DECIDE_PATH ? routeDecide(req, ctx) : routeCron(req, url, ctx)).then(
+        ([status, body]) => sendJson(res, status, body),
+        (err) => {
+          if (err.status === 413) res.once("finish", () => req.destroy());
+          sendJson(res, err.status ?? 502, { error: err.message });
+        },
+      );
+      return;
+    }
+    if (STUDIO_PATH_RE.test(url.pathname)) {
+      routeStudio(req, url, ctx).then(
+        ([status, body]) => sendJson(res, status, body),
+        (err) => {
+          if (err.status === 413) res.once("finish", () => req.destroy());
+          sendJson(res, err.status ?? 502, { error: err.message });
+        },
+      );
+      return;
+    }
+    if (ACCESS_EDIT_PATH_RE.test(url.pathname)) {
+      routeAccessEdit(req, url, ctx).then(
+        ([status, body]) => sendJson(res, status, body),
+        (err) => {
+          if (err.status === 413) res.once("finish", () => req.destroy());
+          sendJson(res, err.status ?? 502, { error: err.message });
+        },
+      );
+      return;
+    }
+    if (ACCESS_PATH_RE.test(url.pathname)) {
+      routeAccess(req, ctx).then(
+        ([status, body]) => sendJson(res, status, body),
+        (err) => sendJson(res, err.status ?? 502, { error: err.message }),
+      );
+      return;
+    }
+    if (AUTHORITY_PATH_RE.test(url.pathname)) {
+      routeAuthority(req, url, ctx).then(
+        ([status, body]) => sendJson(res, status, body),
+        (err) => {
+          if (err.status === 413) res.once("finish", () => req.destroy());
+          sendJson(res, err.status ?? 502, { error: err.message });
+        },
+      );
+      return;
+    }
+    if (CONTROL_UI_PATH_RE.test(url.pathname)) {
+      routeControlUi(req, url, ctx).then(
+        ([status, body]) => sendJson(res, status, body),
+        (err) => sendJson(res, err.status ?? 502, { error: err.message }),
+      );
+      return;
+    }
+    routeApi(url, ctx).then(
+      ([status, body]) => sendJson(res, status, body),
+      (err) => sendJson(res, 502, { error: err.message }),
+    );
+  });
+}
+
+// ── commands ─────────────────────────────────────────────────────────────────
+
+function openInBrowser(url) {
+  const child = spawn("open", [url], { stdio: "ignore", detached: true });
+  child.on("error", () => console.error(`could not run \`open\`; visit ${url.replace(/#.*$/, "")} by hand`));
+  child.unref();
+}
+
+function readServeFile() {
+  try {
+    const info = JSON.parse(fs.readFileSync(SERVE_FILE, "utf8"));
+    process.kill(info.pid, 0);
+    return info;
+  } catch {
+    return null;
+  }
+}
+
+const pad = (s, n) => String(s).padEnd(n);
+
+async function cmdList(flags) {
+  const fleet = await discoverFleet();
+  if (flags.json) {
+    console.log(JSON.stringify(fleet, null, 2));
+    return;
+  }
+  console.log(`${pad("BOT", 12)} ${pad("STATE", 18)} ${pad("CONTROL UI", 34)} BOARD`);
+  for (const b of fleet.bots) {
+    const state = b.health ? `${b.state}/${b.health}` : b.state;
+    const ui = b.controlUi.url ? `${b.controlUi.url}${b.controlUi.via === "proxy" ? " (proxy)" : ""}` : `— ${b.controlUi.via}`;
+    console.log(`${pad(b.key, 12)} ${pad(state + (b.excluded ? " *" : ""), 18)} ${pad(ui, 34)} ${b.board?.hostPath ?? "—"}`);
+  }
+  const proxy = fleet.proxy ? `${fleet.proxy.state}${fleet.proxy.health ? `/${fleet.proxy.health}` : ""}, ${fleet.proxy.routes.length} routes` : "not created";
+  console.log(`\nport proxy: ${proxy}`);
+  if (fleet.bots.some((b) => b.excluded)) console.log("* excluded from snapshots (OASIS_OBSERVATORY_EXCLUDE)");
+  const serve = readServeFile();
+  console.log(serve ? `observatory: http://127.0.0.1:${serve.port}/ (pid ${serve.pid}; \`make observe-open\` unlocks a browser)` : "observatory: not running (`make observatory` starts it)");
+  if (fleet.bots.some((b) => !b.controlUi.url && b.running)) {
+    console.log("a bot with no Control UI address needs the port proxy: `cd bots && make observatory-proxy-up`");
+  }
+}
+
+async function cmdOpen(target) {
+  if (target === "observatory") {
+    const serve = readServeFile();
+    if (!serve) throw new Error("the observatory is not running; start it with `make observatory`");
+    // The page moves the key from the fragment (never sent to a server) into
+    // its localStorage, then removes it from the address bar.
+    openInBrowser(`http://127.0.0.1:${serve.port}/#t=${ensureKey(OBSERVATORY_KEY_FILE)}`);
+    console.log(`opened http://127.0.0.1:${serve.port}/ — this browser is now unlocked; bookmark that address`);
+    return;
+  }
+  if (target === "board") {
+    const serve = readServeFile();
+    if (!serve?.swarmOpenUrl) {
+      throw new Error(
+        "the observatory is not running a swarm dashboard; start it with `make observatory`, " +
+          "or run `make swarm-dashboard` and open the URL it prints",
+      );
+    }
+    // The token is in the fragment, which the browser never sends; the
+    // dashboard page moves it into sessionStorage and clears the address bar.
+    openInBrowser(serve.swarmOpenUrl);
+    console.log(`opened ${new URL(serve.swarmOpenUrl).origin}/ (swarm dashboard)`);
+    return;
+  }
+  const fleet = await discoverFleet();
+  const bot = fleet.bots.find((b) => b.key === target || b.container === target);
+  if (!bot) throw new Error(`unknown bot "${target}"; known: ${fleet.bots.map((b) => b.key).join(", ")}`);
+  if (!bot.controlUi.url) throw new Error(`${bot.key} has no reachable Control UI (${bot.controlUi.via}); start the port proxy`);
+  // A proxied UI opens through the proxy's unlock page, which sets the access
+  // cookie for this browser and then loads the UI.
+  openInBrowser(withOpenUrls({ bots: [bot] }, ensureProxyKey()).bots[0].controlUi.openUrl);
+  console.log(`opened ${bot.controlUi.url}  — first visit asks for the gateway token, then device pairing: \`make pair BOT=${bot.key}\``);
+}
+
+async function cmdPair(target, flags) {
+  const fleet = await discoverFleet();
+  const bot = fleet.bots.find((b) => b.key === target || b.container === target);
+  if (!bot) throw new Error(`unknown bot "${target}"`);
+  if (!bot.running) throw new Error(`${bot.container} is ${bot.state}`);
+  if (flags.approve) {
+    if (!/^[A-Za-z0-9_-]{4,128}$/.test(flags.approve)) throw new Error("invalid request id");
+    const out = await docker(["exec", bot.container, "openclaw", "devices", "approve", flags.approve, "--json"], { timeoutMs: 30_000 });
+    console.log(out.trim());
+    return;
+  }
+  const { pending, paired } = await listDevices(bot.container);
+  console.log(`${bot.key}: ${paired.length} paired (${paired.map((d) => d.clientId ?? "?").join(", ") || "none"}), ${pending.length} pending`);
+  for (const p of pending) {
+    const fields = ["requestId", "clientId", "clientMode", "platform", "displayName", "remoteIp"]
+      .filter((k) => p[k] != null)
+      .map((k) => `${k}=${p[k]}`);
+    const age = typeof p.ts === "number" ? p.ts : p.createdAtMs;
+    console.log(`  ${fields.join("  ")}${age ? `  requested ${new Date(age).toLocaleString()}` : ""}`);
+  }
+  if (pending.length) {
+    console.log(`approve one you just requested: make pair BOT=${bot.key} ID=<requestId>`);
+  }
+}
+
+/** The commit this page runs from, and whether its own files have local
+ *  changes. A change request records it. */
+async function buildLabel() {
+  const repo = path.resolve(SCRIPT_DIR, "..");
+  try {
+    const sha = (await git(repo, ["rev-parse", "--short", "HEAD"], { timeoutMs: 5000 })).trim();
+    const own = ["scripts/claw-observatory.mjs", "scripts/claw-observatory-feedback.mjs", "scripts/observatory"];
+    const dirty = (await git(repo, ["status", "--porcelain", "--", ...own], { timeoutMs: 10_000 })).trim();
+    return dirty ? `${sha}+local-changes` : sha;
+  } catch {
+    return null;
+  }
+}
+
+async function proxyState() {
+  try {
+    const out = await docker(["ps", "-a", "--filter", `name=^${PROXY_CONTAINER}$`, "--format", "{{.State}}"], { timeoutMs: 10_000 });
+    return out.trim() || "not created";
+  } catch {
+    return "unknown (docker did not answer)";
+  }
+}
+
+async function cmdServe(flags) {
+  const port = flags.port ?? DEFAULT_PORT;
+  // A stable key, so the bookmark http://127.0.0.1:<port>/ keeps working. The
+  // page keeps it in localStorage, which belongs to this one origin. It is not
+  // a cookie on purpose: a cookie is not limited to one port, so the browser
+  // would also send it to 127.0.0.1:18789, Orion's gateway, and Orion is the
+  // bot that can reach this server (through host.docker.internal).
+  const token = ensureKey(OBSERVATORY_KEY_FILE);
+  const swarm = {
+    port: SWARM_PORT,
+    url: `http://127.0.0.1:${SWARM_PORT}/`,
+    root: process.env.OASIS_SWARM_ROOT || path.resolve(SCRIPT_DIR, "..", ".."),
+    managed: false,
+    openUrl: null,
+    note: flags.noDashboard ? "not started (--no-dashboard)" : null,
+  };
+  let dashboard = null;
+  if (!flags.noDashboard) {
+    dashboard = await startSwarmDashboard({
+      bin: process.env.OASIS_SWARM_BIN || "swarm",
+      root: swarm.root,
+      port: SWARM_PORT,
+    });
+    if (dashboard.state === "managed") {
+      swarm.managed = true;
+      swarm.openUrl = dashboard.openUrl;
+      dashboard.child.on("exit", (code, signal) => {
+        swarm.openUrl = null;
+        swarm.managed = false;
+        swarm.note = `stopped (${signal ?? `exit ${code}`}); restart the observatory`;
+        console.error(`swarm dashboard: ${swarm.note}`);
+      });
+    } else if (dashboard.state === "foreign") {
+      swarm.note = "started outside the observatory: open the URL that its own terminal printed";
+    } else {
+      swarm.note = dashboard.reason;
+    }
+  }
+  const ctx = {
+    port,
+    token,
+    swarm,
+    snapshotDir: flags.dir ?? DEFAULT_SNAPSHOT_DIR,
+    mailRoot: MAIL_ROOT,
+    author: os.userInfo().username,
+    build: await buildLabel(),
+    feedbackStore: lazyFeedbackStore(DEFAULT_FEEDBACK_DIR),
+  };
+  const server = createObservatoryServer(ctx);
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(port, "127.0.0.1", resolve);
+  });
+  fs.mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
+  // serve.json is 0600 in a 0700 folder that no bot mounts; it carries the
+  // dashboard URL with its token so that `open board` can open it.
+  fs.writeFileSync(
+    SERVE_FILE,
+    JSON.stringify({ port, pid: process.pid, startedAt: new Date().toISOString(), swarmOpenUrl: swarm.openUrl }),
+    { mode: 0o600 },
+  );
+  console.log(`observatory: http://127.0.0.1:${port}/   (bookmark this address; \`make observe-open\` unlocks a new browser; Ctrl-C stops it)`);
+  console.log(`colony: read from ${swarm.root} with ${swarmPython()} (no dashboard needed)`);
+  console.log(
+    swarm.managed
+      ? `swarm dashboard: ${swarm.url} (started with the observatory; link on the Work page, or \`make swarm-open\`)`
+      : `swarm dashboard: ${swarm.note}`,
+  );
+  console.log(`feedback: ${DEFAULT_FEEDBACK_DIR} (\`make feedback\` lists requests, \`make feedback-pull\` queues them)`);
+  const proxy = await proxyState();
+  console.log(
+    proxy === "running"
+      ? "port proxy: running"
+      : `port proxy: ${proxy} — the sandboxed bots' Control UIs need it: \`cd bots && make observatory-proxy-up\``,
+  );
+  if (flags.open) {
+    openInBrowser(`http://127.0.0.1:${port}/#t=${token}`);
+  }
+  // Read every running bot's face now, so the page has it on first load.
+  ctx.discover().then(
+    (f) => f.bots.forEach((b) => maybeRefreshIdentity(ctx, b)),
+    () => {},
+  );
+  const stop = () => {
+    try {
+      const info = JSON.parse(fs.readFileSync(SERVE_FILE, "utf8"));
+      if (info.pid === process.pid) fs.rmSync(SERVE_FILE);
+    } catch {
+      // already gone
+    }
+    if (dashboard?.state === "managed") dashboard.stop();
+    server.close();
+    setTimeout(() => process.exit(0), 300).unref();
+  };
+  process.on("SIGINT", stop);
+  process.on("SIGTERM", stop);
+}
+
+function feedbackLine(f) {
+  const first = f.body.split("\n")[0].slice(0, 70);
+  const images = f.attachments.length ? ` [${f.attachments.length} img]` : "";
+  return `${f.ref}  ${pad(f.status, 11)} ${pad((f.submittedAt ?? f.createdAt ?? "").slice(0, 16), 17)} ${first}${images}`;
+}
+
+async function cmdFeedback(flags) {
+  const [action = "list", ref, status] = flags._;
+  const { openFeedbackStore, pullFeedback } = await import(FEEDBACK_MODULE.href);
+  const store = openFeedbackStore(DEFAULT_FEEDBACK_DIR);
+  try {
+    switch (action) {
+      case "list": {
+        const items = store.list({ status: flags.status, limit: flags.limit ?? 50 });
+        if (flags.json) {
+          console.log(JSON.stringify(items, null, 2));
+        } else if (!items.length) {
+          console.log(`no requests${flags.status ? ` with status ${flags.status}` : ""}`);
+        } else {
+          items.forEach((f) => console.log(feedbackLine(f)));
+        }
+        return;
+      }
+      case "show": {
+        if (!ref) throw new Error("feedback show needs a reference (FB-XXXXXXXX)");
+        const f = store.get(ref);
+        if (flags.json) {
+          console.log(JSON.stringify(f, null, 2));
+          return;
+        }
+        console.log(`${f.ref}  ${f.status}  by ${f.author ?? "?"}  submitted ${f.submittedAt ?? "—"}  updated ${f.updatedAt}`);
+        console.log(`\n${f.body}\n`);
+        for (const a of f.attachments) console.log(`image ${a.seq}: ${a.path}  (${a.name}, ${a.bytes} bytes${a.stored ? "" : ", NOT stored"})`);
+        console.log(`context: ${JSON.stringify(f.context)}`);
+        if (f.resolution) console.log(`resolution: ${f.resolution}`);
+        return;
+      }
+      case "pull": {
+        const out = flags.out ?? DEFAULT_PULL_DIR;
+        const results = pullFeedback(store, out, { dryRun: flags.dryRun });
+        if (!results.length) console.log("no new requests");
+        for (const r of results) {
+          console.log(r.action === "would pull" ? `would pull ${r.ref}: ${r.first}` : `${r.ref}: ${r.action}  ${r.file}${r.note ? `  (${r.note})` : ""}`);
+        }
+        if (results.some((r) => r.action === "left alone")) process.exitCode = 1;
+        return;
+      }
+      case "set": {
+        if (!ref || !status) throw new Error("feedback set needs a reference and a status");
+        const f = store.setStatus(ref, status, flags.note);
+        console.log(`${f.ref} is now ${f.status}${f.resolution ? ` — ${f.resolution}` : ""}`);
+        return;
+      }
+      case "withdraw": {
+        if (!ref) throw new Error("feedback withdraw needs a reference");
+        store.withdraw(ref);
+        console.log(`${ref.toUpperCase()} withdrawn; its images are deleted`);
+        return;
+      }
+      default:
+        throw new Error(`unknown feedback action "${action}" (list, show, pull, set, withdraw)`);
+    }
+  } finally {
+    store.close();
+  }
+}
+
+export function parseFlags(argv) {
+  const flags = { _: [] };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--json") flags.json = true;
+    else if (a === "--open") flags.open = true;
+    else if (a === "--no-commit") flags.noCommit = true;
+    else if (a === "--port") flags.port = Number.parseInt(argv[++i], 10);
+    else if (a === "--dir") flags.dir = argv[++i];
+    else if (a === "--approve") flags.approve = argv[++i];
+    else if (a === "--status") flags.status = argv[++i];
+    else if (a === "--limit") flags.limit = Number.parseInt(argv[++i], 10);
+    else if (a === "--out") flags.out = argv[++i];
+    else if (a === "--note") flags.note = argv[++i];
+    else if (a === "--dry-run") flags.dryRun = true;
+    else if (a === "--no-dashboard") flags.noDashboard = true;
+    else if (a.startsWith("--")) throw new Error(`unknown option ${a}`);
+    else flags._.push(a);
+  }
+  if (flags.port !== undefined && !(flags.port > 0 && flags.port < 65536)) {
+    throw new Error("--port needs a number from 1 to 65535");
+  }
+  return flags;
+}
+
+const USAGE = `usage: claw-observatory.mjs <command>
+
+  list [--json]                     every bot: state, Control UI address, .swarm board
+  open <bot>|observatory|board      open an address in the default browser
+  serve [--port N] [--open] [--dir PATH] [--no-dashboard]
+                                    serve the observatory on 127.0.0.1 (default ${DEFAULT_PORT}),
+                                    and start the swarm dashboard on ${SWARM_PORT}
+  snapshot [--dir PATH] [--no-commit]
+                                    copy each running bot's identity, memory and dream
+                                    files into the history repository and commit
+  pair <bot> [--approve REQUEST_ID] list, or approve, pending Control UI device pairings
+  proxy-key                         create the port proxy access key if missing; print its path
+  proxy-routes [--out FILE]         the port proxy's routes as a compose override, from the fleet
+  key                               print the observatory access key (for a browser's unlock box)
+  rotate-key                        replace the observatory access key
+  feedback list [--status S[,S]] [--limit N] [--json]
+                                    change requests from the page (default: all but drafts)
+  feedback show <FB-ref> [--json]   one request, with the paths of its images
+  feedback pull [--out DIR] [--dry-run]
+                                    new requests -> .swarm/feedback/<ref>.md, status queued
+  feedback set <FB-ref> <status> [--note TEXT]
+                                    status: new, queued, in_progress, done, declined
+  feedback withdraw <FB-ref>        delete a request that is still new
+`;
+
+async function main(argv) {
+  const [command = "list", ...rest] = argv;
+  const flags = parseFlags(rest);
+  switch (command) {
+    case "list":
+      return cmdList(flags);
+    case "open":
+      if (!flags._[0]) throw new Error("open needs a bot key, `observatory`, or `board`");
+      return cmdOpen(flags._[0]);
+    case "serve":
+      return cmdServe(flags);
+    case "snapshot": {
+      const result = await runSnapshot({ dir: flags.dir ?? DEFAULT_SNAPSHOT_DIR, commit: !flags.noCommit });
+      if (result.failures > 0) process.exitCode = 1;
+      return undefined;
+    }
+    case "pair":
+      if (!flags._[0]) throw new Error("pair needs a bot key");
+      return cmdPair(flags._[0], flags);
+    case "feedback":
+      return cmdFeedback(flags);
+    case "proxy-routes": {
+      const plan = planProxyRoutes((await discoverFleet()).bots);
+      const text = renderProxyRoutesOverride(plan);
+      if (flags.out) {
+        fs.mkdirSync(path.dirname(flags.out), { recursive: true });
+        fs.writeFileSync(flags.out, text);
+        console.log(`${plan.routes.length} proxy routes → ${flags.out}${plan.skipped.length ? ` (no route: ${plan.skipped.map((s) => s.key).join(", ")})` : ""}`);
+      } else {
+        process.stdout.write(text);
+      }
+      return undefined;
+    }
+    case "key":
+      // For a browser that `open` cannot reach, such as a Safari web app:
+      // paste the key into the page's unlock box.
+      process.stdout.write(`${ensureKey(OBSERVATORY_KEY_FILE)}\n`);
+      return undefined;
+    case "rotate-key":
+      rotateKey(OBSERVATORY_KEY_FILE);
+      console.log(`new observatory key in ${OBSERVATORY_KEY_FILE}; every browser must unlock again (make observe-open), and a running server must restart`);
+      return undefined;
+    case "proxy-key":
+      ensureProxyKey();
+      console.log(PROXY_KEY_FILE);
+      return undefined;
+    case "help":
+    case "-h":
+    case "--help":
+      process.stdout.write(USAGE);
+      return undefined;
+    default:
+      throw new Error(`unknown command "${command}"\n\n${USAGE}`);
+  }
+}
+
+// Compare real paths, not import.meta.url with a `file://` template: the
+// launchd copy lives under "Application Support", and import.meta.url encodes
+// that space as %20 (and resolves symlinks, which argv[1] does not). The
+// template never matched there, so the nightly job exited 0 without running
+// (2026-09-15 to 2026-09-22: seven snapshots lost).
+function isMainModule() {
+  try {
+    return Boolean(process.argv[1]) && fileURLToPath(import.meta.url) === fs.realpathSync(process.argv[1]);
+  } catch {
+    return false;
+  }
+}
+
+if (isMainModule()) {
+  main(process.argv.slice(2)).catch((err) => {
+    process.stderr.write(`claw-observatory: ${err.message}\n`);
+    process.exit(2);
+  });
+}

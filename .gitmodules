@@ -1,0 +1,20 @@
+[submodule "vendor/openclaw"]
+	path = vendor/openclaw
+	url = https://github.com/openclaw/openclaw.git
+	# Pinned to v2026.7.1-2 (commit 0790d9f593a) to MATCH the deployed runtime
+	# image (Dockerfile.runtime installs npm openclaw@2026.7.1-2). Re-vendored
+	# 2026-08-03 from the stale v2026.4.26 pin so source audits match production
+	# (the 4.26↔6.11/7.1 drift sent the CLAW-076 plugin-tool investigation down a
+	# wrong path). Bump deliberately by checking out the tag matching
+	# Dockerfile.runtime's OPENCLAW_VERSION and committing the submodule pointer.
+	# See README.md "Bumping the openclaw pin" for the procedure.
+[submodule "vendor/oasis-voice"]
+	path = vendor/oasis-voice
+	url = https://github.com/oasis-main/oasis-voice.git
+	branch = dev
+	# Pinned to commit e6bd8b8 (TTS opus support — CLAW-021 outbound).
+	# The oasis-voice:cpu image is built from this submodule; the openclaw
+	# runtime talks to it over the oasis_runtime bridge network as the
+	# `oasis-voice` sidecar (see docker-compose.runtime.yml). Bump the pin
+	# deliberately: `cd vendor/oasis-voice && git fetch && git checkout <sha>`,
+	# rebuild the cpu image, then commit the new submodule pointer.

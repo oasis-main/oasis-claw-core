@@ -1,0 +1,43 @@
+node_modules/
+*.log
+.DS_Store
+dist/
+.env*
+!.env.example
+
+# Personal bot definitions — env files, persona, per-bot compose overlay,
+# per-bot Makefile, anything beyond the generic oasis-claw substrate.
+# Layout convention:
+#   bots/<botname>/.env          # OASIS_TELEGRAM_BOT_TOKEN + chat_id, model creds
+#   bots/docker-compose.bots.yml # overlay: declares per-bot openclaw services
+#   bots/Makefile                # `make BOT=<name> logs|token|recreate|...`
+bots/
+
+# OAuth client secrets (Google / GCP, etc.) — never commit
+client_secret*.json
+*-client-secret.json
+service-account*.json
+
+# Claude Code local session metadata (settings, worktree state)
+.claude/
+
+# Upstream openclaw clone used by audit-sandbox.ts as the auditor's
+# inspector root. Auto-cloned on demand by scripts/audit-sandbox.ts.
+# ~2GB on disk, no reason to track it — the SHA we depend on lives in
+# extensions/browser/UPSTREAM, not in this clone.
+vendor/openclaw-source/
+
+# build artifacts / editor cruft (CLAW-074 commit hygiene)
+__pycache__/
+*.pyc
+.vscode/
+
+# ── Deployment-specific config — NEVER commit to a public repo ───────────────
+# The reviewer policy in extensions/ is a GENERIC base. Real bot identities,
+# access scopes, and constitutions live in a private overlay merged over it by
+# scripts/reviewer-policy-merge.py. See that script's header.
+bots/.runtime/
+# Internal fleet planning notes — describe each bot's role, access, and data.
+.swarm/
+# Fleet mail routing — names every bot and which data each one holds.
+scripts/claw-mail-routes.json

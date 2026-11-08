@@ -1,0 +1,240 @@
+import type {
+  SpeechProviderPlugin,
+  SpeechSynthesisRequest,
+  SpeechSynthesisResult,
+  SpeechSynthesisStreamRequest,
+  SpeechSynthesisStreamResult,
+  SpeechTelephonySynthesisRequest,
+  SpeechTelephonySynthesisResult,
+} from "openclaw/plugin-sdk/speech";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
+const DEFAULT_ENDPOINT = "http://127.0.0.1:8731";
+const DEFAULT_VOICE = "piper:en_GB-aru-medium";
+
+// ── Self-service voice override (CLAW-107 Phase 1) ───────────────────────────
+// The bot's own chosen voice, written by the `voice_set` tool in the SEPARATE
+// oasis-voice-control extension. Kept as a FILE rather than as config because a
+// running gateway must never have its openclaw.json rewritten underneath it —
+// the next turn dies with "config changed since last load". A file read per
+// synthesis is cheap and takes effect immediately, with no recreate.
+//
+// The writer is extensions/oasis-voice-control/src/voice-state.ts. This reader
+// is deliberately a small duplicate rather than a cross-extension import:
+// extensions are separate packages mounted side by side, and a relative import
+// across them is fragile. Keep the PATH and the FIELD NAME in sync.
+const VOICE_OVERRIDE_FILE = "voice-choice.json";
+
+function overridePath(): string {
+  const home = process.env.OPENCLAW_HOME || path.join(os.homedir(), ".openclaw");
+  return path.join(home, VOICE_OVERRIDE_FILE);
+}
+
+function readVoiceOverride(): string | undefined {
+  try {
+    const raw = JSON.parse(fs.readFileSync(overridePath(), "utf8")) as { voice_id?: unknown };
+    const v = raw?.voice_id;
+    return typeof v === "string" && v.length > 0 ? v : undefined;
+  } catch {
+    // Absent (the normal case) or malformed. Either way fall through to config
+    // rather than failing synthesis: losing the chosen voice is recoverable,
+    // losing speech entirely is not.
+    return undefined;
+  }
+}
+
+// Piper's lite-tier output is 22050 Hz int16 WAV.
+// Twilio Media Streams expect 8000 Hz µ-law (mulaw).  We ask oasis-voice
+// /v1/tts/speak for raw PCM at 8000 Hz then encode to mulaw here so the
+// telephony path stays dependency-free on the openclaw side.
+const TELEPHONY_SAMPLE_RATE = 8_000;
+
+function getEndpoint(providerConfig: Record<string, unknown>): string {
+  const raw = providerConfig["endpoint"];
+  return typeof raw === "string" && raw.length > 0 ? raw : DEFAULT_ENDPOINT;
+}
+
+function getVoice(providerConfig: Record<string, unknown>): string {
+  // Resolution order, highest first:
+  //   1. the bot's own choice, set at runtime via the voice_set tool
+  //   2. tts_voice from config (OASIS_VOICE_TTS_VOICE, set by the operator)
+  //   3. the built-in default
+  const chosen = readVoiceOverride();
+  if (chosen) {
+    return chosen;
+  }
+  const raw = providerConfig["tts_voice"];
+  return typeof raw === "string" && raw.length > 0 ? raw : DEFAULT_VOICE;
+}
+
+function getBearer(providerConfig: Record<string, unknown>): string | undefined {
+  const raw = providerConfig["bearer_token"];
+  return typeof raw === "string" && raw.length > 0 ? raw : undefined;
+}
+
+function buildHeaders(bearer?: string): Record<string, string> {
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (bearer) {
+    headers["Authorization"] = `Bearer ${bearer}`;
+  }
+  return headers;
+}
+
+// Linear PCM16 (int16 LE, mono) → µ-law encoding per ITU-T G.711.
+// Only used for the telephony path (8 kHz, 1 channel).
+function pcm16ToMulaw(pcm: Buffer): Buffer {
+  const out = Buffer.allocUnsafe(pcm.length / 2);
+  for (let i = 0; i < out.length; i++) {
+    let sample = pcm.readInt16LE(i * 2);
+    const sign = sample < 0 ? 0x80 : 0;
+    if (sample < 0) sample = -sample;
+    sample += 33; // bias
+    if (sample > 32767) sample = 32767;
+    let exponent = 7;
+    for (let exp = 0x4000; (sample & exp) === 0 && exponent > 0; exp >>= 1) exponent--;
+    const mantissa = (sample >> (exponent + 3)) & 0x0f;
+    out[i] = ~(sign | (exponent << 4) | mantissa) & 0xff;
+  }
+  return out;
+}
+
+export function buildOasisVoiceSpeechProvider(): SpeechProviderPlugin {
+  return {
+    id: "oasis-voice",
+    label: "Oasis Voice",
+    aliases: ["oasis-ai-tts", "piper"],
+    autoSelectOrder: 5,
+
+    isConfigured: ({ providerConfig }) => {
+      // Always available — lite tier needs no credentials; cloud tier uses
+      // bearer_token which is optional (handled gracefully below).
+      return typeof getEndpoint(providerConfig) === "string";
+    },
+
+    synthesize: async (req: SpeechSynthesisRequest): Promise<SpeechSynthesisResult> => {
+      const endpoint = getEndpoint(req.providerConfig);
+      const voice = getVoice(req.providerConfig);
+      const bearer = getBearer(req.providerConfig);
+
+      // When the framework asks for a "voice-note", channels like Telegram
+      // route the result through `sendVoice` — which only accepts opus-in-OGG,
+      // not WAV. Request `?format=opus` from oasis-voice so the WAV→opus
+      // transcode happens server-side (ffmpeg in the sidecar). For
+      // "audio-file" / "auto-detect" targets we keep WAV: it's cheaper and
+      // libsndfile-compatible everywhere we hand it off.
+      const wantsVoiceNote = req.target === "voice-note";
+      const url = new URL(`${endpoint}/v1/tts/speak`);
+      if (wantsVoiceNote) {
+        url.searchParams.set("format", "opus");
+      }
+
+      const res = await fetch(url.toString(), {
+        method: "POST",
+        headers: buildHeaders(bearer),
+        body: JSON.stringify({ text: req.text, voice }),
+        signal: AbortSignal.timeout(req.timeoutMs),
+      });
+      if (!res.ok) {
+        throw new Error(`oasis-voice TTS error ${res.status}: ${await res.text()}`);
+      }
+      const audioBuffer = Buffer.from(await res.arrayBuffer());
+      return {
+        audioBuffer,
+        outputFormat: wantsVoiceNote ? "opus" : "wav",
+        fileExtension: wantsVoiceNote ? ".ogg" : ".wav",
+        voiceCompatible: wantsVoiceNote,
+      };
+    },
+
+    streamSynthesize: async (
+      req: SpeechSynthesisStreamRequest,
+    ): Promise<SpeechSynthesisStreamResult> => {
+      const endpoint = getEndpoint(req.providerConfig);
+      const voice = getVoice(req.providerConfig);
+      const bearer = getBearer(req.providerConfig);
+
+      const wsUrl = endpoint.replace(/^http/, "ws") + "/v1/tts/stream";
+      const ws = new WebSocket(wsUrl, {
+        headers: bearer ? { Authorization: `Bearer ${bearer}` } : undefined,
+      } as ConstructorParameters<typeof WebSocket>[1]);
+
+      const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
+      const writer = writable.getWriter();
+      let headerReceived = false;
+
+      await new Promise<void>((resolve, reject) => {
+        ws.onopen = () => {
+          ws.send(JSON.stringify({ text: req.text, voice }));
+          resolve();
+        };
+        ws.onerror = (ev) => reject(new Error(`oasis-voice WS error: ${String(ev)}`));
+      });
+
+      ws.onmessage = (ev) => {
+        if (!headerReceived && typeof ev.data === "string") {
+          headerReceived = true; // first message is JSON header
+          return;
+        }
+        if (ev.data instanceof ArrayBuffer) {
+          writer.write(new Uint8Array(ev.data)).catch(() => {});
+        } else if (typeof ev.data === "string") {
+          // boundary marker or done — ignore
+        }
+      };
+      ws.onclose = () => writer.close().catch(() => {});
+      ws.onerror = (ev) => writer.abort(new Error(`oasis-voice WS error: ${String(ev)}`)).catch(() => {});
+
+      return {
+        audioStream: readable,
+        outputFormat: "pcm16",
+        fileExtension: ".wav",
+        voiceCompatible: req.target === "voice-note",
+        release: async () => {
+          try {
+            ws.close();
+          } catch {
+            // ignore
+          }
+        },
+      };
+    },
+
+    synthesizeTelephony: async (
+      req: SpeechTelephonySynthesisRequest,
+    ): Promise<SpeechTelephonySynthesisResult> => {
+      const endpoint = getEndpoint(req.providerConfig);
+      const voice = getVoice(req.providerConfig);
+      const bearer = getBearer(req.providerConfig);
+
+      // Request raw int16 PCM at 8 kHz by appending query params.
+      // oasis-voice /v1/tts/speak returns WAV; we strip the 44-byte header.
+      const url = new URL(`${endpoint}/v1/tts/speak`);
+      url.searchParams.set("sample_rate", String(TELEPHONY_SAMPLE_RATE));
+      url.searchParams.set("channels", "1");
+
+      const res = await fetch(url.toString(), {
+        method: "POST",
+        headers: buildHeaders(bearer),
+        body: JSON.stringify({ text: req.text, voice }),
+        signal: AbortSignal.timeout(req.timeoutMs),
+      });
+      if (!res.ok) {
+        throw new Error(`oasis-voice telephony TTS error ${res.status}: ${await res.text()}`);
+      }
+      const wavBuffer = Buffer.from(await res.arrayBuffer());
+
+      // Strip the WAV header (44 bytes for standard PCM WAV) to get raw PCM16.
+      const WAV_HEADER_BYTES = 44;
+      const pcm16 = wavBuffer.subarray(WAV_HEADER_BYTES);
+      const audioBuffer = pcm16ToMulaw(pcm16);
+
+      return {
+        audioBuffer,
+        outputFormat: "mulaw",
+        sampleRate: TELEPHONY_SAMPLE_RATE,
+      };
+    },
+  };
+}

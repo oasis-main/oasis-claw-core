@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  claw-mail-waker (CLAW-076) — event-driven wake for inter-bot mail.
+
+  A persistent host daemon that starts a cheap isolated turn on a bot when new
+  peer mail lands in its inbox, so bots respond within ~1 poll interval without
+  interrupting their main work.
+
+  ██ macOS TCC — READ THIS ██
+  A launchd LaunchAgent CANNOT read ~/Documents (same trap that silently killed
+  orion-watchdog). So:
+   - ProgramArguments points at a COPY of the daemon under ~/Library/Application
+     Support, NOT at the repo script under ~/Documents.
+   - The daemon reads NOTHING under ~/Documents: it inspects inboxes THROUGH the
+     containers (`docker exec <bot> ls /reach/mail/inbox`) and keeps its cursor
+     under ~/Library. Only `docker` is needed — no Full Disk Access grant.
+
+  DEPLOY (copy the daemon out of ~/Documents, then load):
+    mkdir -p "$HOME/Library/Application Support/oasis-x"
+    cp scripts/claw-mail-waker.mjs "$HOME/Library/Application Support/oasis-x/claw-mail-waker.mjs"
+    sed "s|__HOME__|$HOME|g" scripts/com.oasis-x.claw-mail-waker.plist > "$HOME/Library/LaunchAgents/com.oasis-x.claw-mail-waker.plist"
+    launchctl unload "$HOME/Library/LaunchAgents/com.oasis-x.claw-mail-waker.plist" 2>/dev/null
+    launchctl load   "$HOME/Library/LaunchAgents/com.oasis-x.claw-mail-waker.plist"
+  Re-copy the .mjs after any edit — the deployed copy does not track the repo.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.oasis-x.claw-mail-waker</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/node</string>
+        <string>__HOME__/Library/Application Support/oasis-x/claw-mail-waker.mjs</string>
+    </array>
+
+    <!-- Persistent daemon: it runs its own 60s poll loop, so KeepAlive (restart
+         on crash) rather than StartInterval (re-run). -->
+    <key>KeepAlive</key>
+    <true/>
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+        <key>HOME</key>
+        <string>__HOME__</string>
+        <!-- 60s poll (operator 2026-08-03). Override here if needed. -->
+        <key>CLAW_WAKER_POLL_MS</key>
+        <string>60000</string>
+        <!-- Isolated wake-turn ceiling (operator 2026-08-17). WAS the code default of
+             180s, too short for a multi-step task (several exec calls, each with
+             model latency + Layer-2 reviewer latency) — observed live: Lyra's
+             foamfn tryout was killed by `embedded run timeout` at exactly 180000ms
+             mid-checklist, after materializing a test case but before it could
+             reply. 600s gives a several-step task real room. Tradeoff: inFlight
+             blocks a bot's OWN mailbox from re-waking until its current wake ends,
+             so a genuinely stuck run now stalls that bot's mail for up to 10min
+             instead of 3 — accepted since a hang is rarer than starving real work. -->
+        <key>CLAW_WAKER_TIMEOUT_S</key>
+        <string>600</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/Library/Logs/claw-mail-waker.stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/Library/Logs/claw-mail-waker.stderr.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

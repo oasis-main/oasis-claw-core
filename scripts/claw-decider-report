@@ -1,0 +1,219 @@
+#!/usr/bin/env python3
+"""claw-decider-report — how the decision-model shadow (CLAW-118) compares
+with the Layer 2 judge, per bot, from each bot's reviewer-audit.jsonl.
+
+Reads phase:"decider_shadow", "decider_dropped" and "audit_write_error"
+rows. Read-only: `docker exec ... cat`.
+
+  scripts/claw-decider-report                 # last 24 h, every running bot
+  scripts/claw-decider-report --hours 168 --bot vega
+  scripts/claw-decider-report --json          # machine-readable, for the plan
+
+What the numbers mean:
+  agree        decider verdict == judge verdict, over rows where both exist
+  confusion    judge verdict -> decider verdict counts
+  by-conf      agreement inside decider-confidence bands; a usable fast path
+               needs high agreement in the top band, not a high average
+  errors       decider unreachable / timed out / bad answer
+  l1_only      calls that Layer 1 decided alone (no judge verdict); agreement
+               is with Layer 1's own verdict
+  dropped      decider calls that the reviewer's in-flight cap refused
+  write errors audit-write outages that the reviewer recorded after recovery
+  unparseable  lines that are not valid JSON, counted over the WHOLE file (a
+               broken line has no readable time). Never dropped in silence.
+  read error   the audit file could not be read from the container
+"""
+
+from __future__ import annotations
+
+import argparse
+import collections
+import datetime as dt
+import json
+import subprocess
+import sys
+
+CONTAINERS = {
+    "orion": "oasis-claw-runtime",
+    "sample-bot": "oasis-claw-sample-bot",
+    "vega": "oasis-claw-vega",
+    "lyra": "oasis-claw-lyra",
+    "rigel": "oasis-claw-rigel",
+    "altair": "oasis-claw-altair",
+    "vandeneb": "oasis-claw-vandeneb",
+}
+AUDIT = "/home/node/.openclaw/logs/reviewer/reviewer-audit.jsonl"
+BANDS = [(0.0, 0.5), (0.5, 0.7), (0.7, 0.9), (0.9, 1.01)]
+
+
+PHASES = ("decider_shadow", "decider_dropped", "audit_write_error")
+
+
+def parse_audit(text: str, since: dt.datetime) -> dict:
+    """Split an audit file into the rows this report reads. Pure: unit-tested.
+
+    Nothing is dropped in silence: a line that is not JSON counts as
+    `unparseable`, and a row of a read phase without a readable `ts` counts as
+    `bad_ts`. Neither count is windowed, because neither line has a usable time.
+    """
+    out: dict = {p: [] for p in PHASES}
+    out.update(lines=0, unparseable=0, bad_ts=0)
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        out["lines"] += 1
+        try:
+            r = json.loads(line)
+        except json.JSONDecodeError:
+            out["unparseable"] += 1
+            continue
+        if not isinstance(r, dict):
+            out["unparseable"] += 1
+            continue
+        phase = r.get("phase")
+        if phase not in PHASES:
+            continue
+        try:
+            ts = dt.datetime.fromisoformat(str(r["ts"]).replace("Z", "+00:00"))
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=dt.timezone.utc)
+        except (KeyError, ValueError):
+            out["bad_ts"] += 1
+            continue
+        if ts >= since:
+            out[phase].append(r)
+    return out
+
+
+def rows_for(container: str, since: dt.datetime) -> dict:
+    try:
+        res = subprocess.run(["docker", "exec", container, "cat", AUDIT],
+                             capture_output=True, text=True, timeout=30)
+    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+        parsed = parse_audit("", since)
+        parsed["read_error"] = type(e).__name__
+        return parsed
+    parsed = parse_audit(res.stdout, since)
+    parsed["read_error"] = (
+        f"exit {res.returncode}: {res.stderr.strip()[:120]}" if res.returncode != 0 else None)
+    return parsed
+
+
+def pct(sorted_vals: list[float], q: float):
+    return sorted_vals[min(len(sorted_vals) - 1, int(q * len(sorted_vals)))] if sorted_vals else None
+
+
+def summarize(parsed: dict) -> dict:
+    rows = parsed["decider_shadow"]
+    dropped = parsed["decider_dropped"]
+    write_errors = parsed["audit_write_error"]
+    tool = [r for r in rows if r.get("kind") == "tool_call"]
+    paired = [r for r in tool if r.get("decVerdict") and r.get("l2Verdict")]
+    confusion = collections.Counter(f"{r['l2Verdict']}->{r['decVerdict']}" for r in paired)
+    bands = {}
+    for lo, hi in BANDS:
+        b = [r for r in paired if lo <= (r.get("decVerdictP") or 0) < hi]
+        bands[f"{lo:.1f}-{min(hi, 1.0):.1f}"] = {
+            "n": len(b),
+            "agree": round(sum(r["decVerdict"] == r["l2Verdict"] for r in b) / len(b), 3) if b else None,
+        }
+    model_ms = sorted(r["decModelMs"] for r in rows if isinstance(r.get("decModelMs"), (int, float)))
+    inj = [r for r in rows if r.get("kind") == "injection_report"]
+    l1 = [r for r in rows if r.get("kind") == "l1_only"]
+    l1_paired = [r for r in l1 if r.get("decVerdict") and r.get("l1Verdict")]
+    clipped = collections.Counter(f for r in rows for f in (r.get("decClipped") or []))
+    return {
+        "rows": len(rows),
+        "tool_calls": len(tool),
+        "paired_with_judge": len(paired),
+        "agree": round(sum(r["decVerdict"] == r["l2Verdict"] for r in paired) / len(paired), 3) if paired else None,
+        "confusion": dict(confusion.most_common()),
+        "by_confidence": bands,
+        # The case that matters most for any future fast path: the judge said
+        # deny or escalate and the decider was confident it was an allow.
+        "confident_allow_on_judge_block": sum(
+            1 for r in paired
+            if r["decVerdict"] == "allow" and r["l2Verdict"] != "allow" and (r.get("decVerdictP") or 0) >= 0.9),
+        "injection_reports": dict(collections.Counter(r.get("decVerdict") for r in inj)),
+        "errors": sum(1 for r in rows if r.get("decError")),
+        "timeouts": sum(1 for r in rows if r.get("decTimedOut")),
+        # 503 from the sidecar's pending-call limit: overload, not a slow model.
+        "busy": sum(1 for r in rows if "busy" in (r.get("decError") or "")),
+        "model_ms_p50": pct(model_ms, 0.5),
+        "model_ms_p90": pct(model_ms, 0.9),
+        "by_kind": dict(collections.Counter(r.get("kind") for r in rows)),
+        "l1_only": len(l1),
+        "l1_only_agree": (round(sum(r["decVerdict"] == r["l1Verdict"] for r in l1_paired) / len(l1_paired), 3)
+                          if l1_paired else None),
+        "l1_only_confusion": dict(collections.Counter(
+            f"{r['l1Verdict']}->{r['decVerdict']}" for r in l1_paired).most_common()),
+        # State fields the decider limits cut (rows written before 2026-11-07
+        # have no decClipped and count as not cut).
+        "clipped_fields": dict(clipped),
+        # The timeout in force; rows before 2026-11-07 have none (key "None").
+        "timeout_ms": {str(k): v for k, v in collections.Counter(r.get("decTimeoutMs") for r in rows).items()},
+        "dropped": len(dropped),
+        "dropped_by_kind": dict(collections.Counter(r.get("kind") for r in dropped)),
+        "write_error_rows": len(write_errors),
+        "write_failed_writes": sum(int(r.get("failedWrites") or 0) for r in write_errors),
+        "write_lost_rows": sum(int(r.get("lostRows") or 0) for r in write_errors),
+        "unparseable_lines": parsed["unparseable"],
+        "bad_ts": parsed["bad_ts"],
+        "read_error": parsed.get("read_error"),
+    }
+
+
+def merge(parsed: list[dict]) -> dict:
+    out: dict = {p: [r for x in parsed for r in x[p]] for p in PHASES}
+    out["unparseable"] = sum(x["unparseable"] for x in parsed)
+    out["bad_ts"] = sum(x["bad_ts"] for x in parsed)
+    out["lines"] = sum(x["lines"] for x in parsed)
+    errs = [x.get("read_error") for x in parsed if x.get("read_error")]
+    out["read_error"] = f"{len(errs)} bot(s)" if errs else None
+    return out
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--hours", type=float, default=24)
+    ap.add_argument("--bot", choices=sorted(CONTAINERS))
+    ap.add_argument("--json", action="store_true")
+    a = ap.parse_args()
+    since = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=a.hours)
+    bots = [a.bot] if a.bot else list(CONTAINERS)
+    per_bot = {b: rows_for(CONTAINERS[b], since) for b in bots}
+    report = {b: summarize(p) for b, p in per_bot.items()}
+    report["ALL"] = summarize(merge(list(per_bot.values())))
+    if a.json:
+        json.dump(report, sys.stdout, indent=2)
+        print()
+        return 0
+    print(f"decider shadow vs Layer 2 judge, last {a.hours:g} h")
+    for b, s in report.items():
+        # Data-loss counters print even when there are no decider rows: an
+        # empty report must not hide a read error or a broken file.
+        loss = (f"dropped {s['dropped']}  write-error rows {s['write_error_rows']} "
+                f"(failed {s['write_failed_writes']}, lost {s['write_lost_rows']})  "
+                f"unparseable {s['unparseable_lines']}  bad-ts {s['bad_ts']}")
+        if s["read_error"]:
+            loss += f"  READ ERROR {s['read_error']}"
+        if not s["rows"]:
+            print(f"  {b:12} no decider rows  {loss}")
+            continue
+        print(f"  {b:12} rows {s['rows']:5}  paired {s['paired_with_judge']:5}  agree {s['agree']}  "
+              f"l1-only {s['l1_only']:5} (agree with L1 {s['l1_only_agree']})  "
+              f"confident-allow-on-block {s['confident_allow_on_judge_block']}  "
+              f"errors {s['errors']} (timeout {s['timeouts']}, busy {s['busy']})  "
+              f"model ms p50/p90 {s['model_ms_p50']}/{s['model_ms_p90']}")
+        print(f"  {'':12} {loss}  clipped {s['clipped_fields']}  timeout-ms {s['timeout_ms']}")
+    allr = report["ALL"]
+    if allr["paired_with_judge"]:
+        print(f"  confusion (judge->decider): {allr['confusion']}")
+        print(f"  agreement by decider confidence: {allr['by_confidence']}")
+    if allr["injection_reports"]:
+        print(f"  injection reports (decider verdicts): {allr['injection_reports']}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

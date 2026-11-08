@@ -1,0 +1,340 @@
+# oasis-claw runtime image — full openclaw gateway + our 10 extensions
+#
+# Uses npm-published openclaw@2026.7.1-2 and bakes our extensions in at
+# /app/extensions/<id>. tsx loads the .ts entry points directly so we don't ship
+# a compile step.
+#
+# Version history / why:
+#   2026.4.26 -> 2026.6.11  CLAW-024: clears 99 GHSA advisories.
+#   2026.6.11 -> 2026.7.1-2 CLAW-073: picks up the Telegram getUpdates fixes.
+#     The fleet was logging ~9-10 polling stall/stop events per bot per day,
+#     which wedged the channel and made the exec-approval "ask" path unusable
+#     (dead approval cards -> hung tasks -> the CLAW-072 scope-down). Upstream
+#     5a10a29807 "retry transient getUpdates API errors in ingress worker"
+#     (2026-07-01) adds isRetryableTelegramApiError (429 + retry_after, 500,
+#     502) and a retry policy in the ingress worker; before it a single
+#     transient Bot API error killed the poll loop. Also picks up 2a55c7c59a
+#     (rescoped ingress watchdog). Both are in v2026.7.1; NEITHER is in 6.11,
+#     and neither is in the 2026.6.33 "extended-stable" line, which is frozen
+#     off an older base — do not "upgrade" to 6.33.
+#
+# Version numbering is YYYY.M.<release-ordinal>, NOT a date: 2026.6.11 is the
+# 11th June release, and 2026.5.6 is OLDER than it, not newer. The `-1`/`-2`
+# suffixes are upstream's post-release hotfix convention; npm dist-tag `latest`
+# points at 2026.7.1-2 (there is no matching git tag for the hotfix builds).
+#
+# Build:  docker build -f Dockerfile.runtime -t oasis-claw-runtime .
+# Run:    docker compose -f docker-compose.runtime.yml up -d
+#
+# Networking note: gateway binds 0.0.0.0:18789 *inside* the container so
+# Docker's port-publish can forward it. Host-side mapping is 127.0.0.1:18789
+# (see compose) so LAN/IoT devices can't reach it. Auth token is mandatory.
+
+FROM node:22-bookworm-slim
+
+ARG OPENCLAW_VERSION=2026.7.1-2
+
+# System batteries: git for plugin install, openssl for token gen, tini for
+# proper signal handling, python3 for openclaw.json templating in entrypoint.
+# awscli (v1, Debian pkg) for Vega's cloud work — reviewer-gated exec, creds
+# supplied per-bot via a RO ~/.aws mount (2026-07-30). It honors HTTPS_PROXY, so
+# it works from a sandboxed bot where openclaw's pinned-DNS web tools do not.
+# poppler-utils (operator, 2026-09-15): `pdftotext` for Lyra (and any other
+# bot) to actually read a fetched PDF. curl/wget already land the bytes on
+# disk, but nothing in the image could turn them into text (ripgrep and
+# xmllint do not parse PDF). pdftotext needs no network and no interpreter.
+# ripgrep, libxml2-utils (operator, 2026-09-15): `rg` and `xmllint` are already in
+# several bots' exec.allow (vega, lyra, altair, sample-bot,
+# vandeneb, rigel role.yaml) but were never actually installed here — the
+# binaries were silently missing from every container.
+# python3-pip + python3-venv (operator, 2026-09-15): several bots' role.yaml
+# (vega, lyra, altair, sample-bot, vandeneb) trust pypi.org so
+# they can build a dedicated per-project venv and install real dependencies
+# into it. python3-pip alone only gives a system-wide pip; `python3 -m venv`
+# still fails with "ensurepip is not available" without python3-venv too, so
+# a per-project venv needs both packages together to actually get a working
+# pip inside it.
+RUN apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      ca-certificates curl git openssl python3 python3-yaml python3-pip python3-venv \
+      procps lsof jq awscli poppler-utils ripgrep libxml2-utils && \
+    rm -rf /var/lib/apt/lists/*
+
+# gog CLI for Gmail/Calendar/Drive (https://github.com/steipete/gogcli).
+# OAuth tokens are encrypted with GOG_KEYRING_PASSWORD and live in the
+# /home/node/.openclaw volume, so they persist across image rebuilds.
+# Releases ship as gogcli_<version>_<os>_<arch>.tar.gz; binary inside is `gog`.
+# TARGETARCH is set automatically by buildx (amd64 or arm64).
+ARG GOGCLI_VERSION=0.15.0
+ARG TARGETARCH
+RUN case "${TARGETARCH:-amd64}" in \
+      amd64) GOG_ARCH=linux_amd64 ;; \
+      arm64) GOG_ARCH=linux_arm64 ;; \
+      *) echo "unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
+    esac && \
+    curl -fsSL "https://github.com/steipete/gogcli/releases/download/v${GOGCLI_VERSION}/gogcli_${GOGCLI_VERSION}_${GOG_ARCH}.tar.gz" \
+      | tar -xz -C /usr/local/bin gog && \
+    chmod +x /usr/local/bin/gog && \
+    /usr/local/bin/gog --version
+
+# session-manager-plugin: the AWS CLI needs this to run `aws ssm
+# start-session` (interactive Session Manager
+# shells were blocked on this being absent; awscli alone only covers
+# send-command/get-command-invocation, not an interactive session). Official
+# .deb, no apt repo entry exists for it. Same TARGETARCH pattern as gog above.
+RUN case "${TARGETARCH:-amd64}" in \
+      amd64) SSM_ARCH=ubuntu_64bit ;; \
+      arm64) SSM_ARCH=ubuntu_arm64 ;; \
+      *) echo "unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
+    esac && \
+    curl -fsSL -o /tmp/session-manager-plugin.deb \
+      "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/${SSM_ARCH}/session-manager-plugin.deb" && \
+    dpkg -i /tmp/session-manager-plugin.deb && \
+    rm -f /tmp/session-manager-plugin.deb && \
+    session-manager-plugin --version
+
+# openclaw CLI + tsx + sharp installed globally.
+#
+# sharp MUST be global, not at /app/node_modules: openclaw's runtime lives at
+# /usr/local/lib/node_modules/openclaw/, so its `require("sharp")` walks
+# parent dirs of that path and never reaches /app. Global install lands sharp
+# at /usr/local/lib/node_modules/sharp, which is in NODE_PATH and reachable
+# via the standard node_modules walk from openclaw's location.
+#
+# sharp ships prebuilt libvips binaries for linux-arm64 + linux-x64; no extra
+# apt packages needed on bookworm-slim.
+# amazon-bedrock-provider (2026-08-12): NOT bundled in core openclaw dist —
+# confirmed by absence from dist/extensions/ (anthropic/google/openai ARE
+# there; amazon-bedrock and moonshot are not — same external-package pattern
+# docs/providers/model-providers.md documents for moonshot: "Install
+# @openclaw/moonshot-provider before onboarding"). Without this, a
+# models.providers["amazon-bedrock"] config entry resolves and even attempts
+# the call, but every request fails with "No API provider registered for api:
+# bedrock-converse-stream" — a transport gap, not an auth/config problem.
+# Version pinned to the same 2026.7.1 train as OPENCLAW_VERSION.
+RUN npm install -g openclaw@${OPENCLAW_VERSION} tsx@4 sharp@0.34 @openclaw/amazon-bedrock-provider@2026.7.1
+
+# CLAW-083 interim patch: openclaw's plugin-loader cache restore replaces
+# instead of merges memory-prompt-supplement state, so a scoped load (e.g.
+# tool-schema discovery) can silently evict dot-swarm's/oasis-reach's
+# supplement. Fixed upstream by openclaw/openclaw#117372, but only from
+# v2026.8.1-beta.1 onward — nowhere near our pinned stable line yet (checked
+# 2026-08-11: v2026.7.1-2 and main have diverged, 224 commits / 3+ weeks
+# apart; adopting the beta is its own deliberate migration, not a drop-in).
+# This patches the COMPILED global install directly (root, before USER node
+# below) and fails the build loudly if OPENCLAW_VERSION ever changes the
+# compiled shape it expects — see scripts/patch-openclaw-cache-state.mjs for
+# the full writeup and the removal plan once we adopt a release with #117372.
+COPY scripts/patch-openclaw-cache-state.mjs /tmp/patch-openclaw-cache-state.mjs
+RUN node /tmp/patch-openclaw-cache-state.mjs && rm /tmp/patch-openclaw-cache-state.mjs
+
+# CLAW-099 interim patch: openclaw's process-wide unhandled-rejection handler
+# calls process.exit(1) on any rejection that doesn't match its transient-
+# network allow-list, and that allow-list doesn't recognize the gateway
+# client's own thrown error messages ("gateway not connected", "gateway
+# request timeout for ...", "gateway closed (...)") -- so a routine dropped
+# or timed-out gateway connection can crash the whole TUI process instead of
+# degrading gracefully. Also widens the TUI's onGap handler to re-arm the
+# streaming watchdog on a sequence gap alone, not only a full reconnect, so a
+# partial response is less likely to freeze without ever reconciling. See
+# scripts/patch-openclaw-network-resilience.mjs for the full writeup, the
+# fail-loud-on-mismatch guard, and the removal plan.
+COPY scripts/patch-openclaw-network-resilience.mjs /tmp/patch-openclaw-network-resilience.mjs
+RUN node /tmp/patch-openclaw-network-resilience.mjs && rm /tmp/patch-openclaw-network-resilience.mjs
+
+# Generic, opt-in TUI theming: adds OASIS_TUI_BANNER_TITLE and
+# OASIS_TUI_ACCENT_COLOR environment-variable overrides for the CLI banner
+# title and every hardcoded accent/toolTitle color site, falling back to
+# today's exact stock values when unset -- a no-op for any bot that doesn't
+# set them. Not a bug fix; see scripts/patch-openclaw-theme.mjs for the full
+# writeup and patch-site list. The actual per-bot title/color choice belongs
+# in that bot's own .env, never here.
+COPY scripts/patch-openclaw-theme.mjs /tmp/patch-openclaw-theme.mjs
+RUN node /tmp/patch-openclaw-theme.mjs && rm /tmp/patch-openclaw-theme.mjs
+
+# runtime.llm.complete() drops the reply's stopReason/errorMessage, so a
+# provider-side stop (e.g. Bedrock content_filtered -> finish_reason
+# content_filter) reaches oasis-reviewer's judge as a bare empty string
+# (2026-10-17: 4 Orion reach_send denies, cause invisible in the audit).
+# Additive patch; fails the build on a shape mismatch. See the script.
+COPY scripts/patch-openclaw-llm-stop-reason.mjs /tmp/patch-openclaw-llm-stop-reason.mjs
+RUN node /tmp/patch-openclaw-llm-stop-reason.mjs && rm /tmp/patch-openclaw-llm-stop-reason.mjs
+
+# Playwright + Chromium for the vendored `browser` plugin (extensions/browser/).
+# Three layered pins; bump independently per AUDIT_LOG.md and extensions/browser/UPSTREAM:
+#   PLAYWRIGHT_VERSION  — JS library
+#   CHROMIUM_REVISION   — binary build inside Playwright's cache
+# Both are kept in lockstep with playwright-core@1.59.1's browsers.json. The
+# `test -d` assertion below fails the build if the pinned revision dir isn't
+# laid down — the early-fail-loud property means a silently-republished build
+# trips the build, not a deploy.
+#
+# Browsers live at /opt/playwright (image-level, not the persistent volume),
+# so a stale /home/node/.openclaw on a new image with a bumped CHROMIUM_REVISION
+# can never shadow the binary. User profile data still goes under the volume
+# at /home/node/.openclaw/browser/ (configured at the runtime-config layer).
+#
+# `--with-deps` pulls the apt set Chromium needs on bookworm-slim (libnss3,
+# libdrm2, libxkbcommon0, libxcomposite1, libgtk-3-0, fonts-liberation, etc.,
+# ~150–200MB). Curating that list manually is a CVE-management nightmare, so
+# we let Playwright own it.
+ARG PLAYWRIGHT_VERSION=1.59.1
+ARG CHROMIUM_REVISION=1217
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/playwright
+RUN npm install -g playwright-core@${PLAYWRIGHT_VERSION} playwright@${PLAYWRIGHT_VERSION} && \
+    mkdir -p "${PLAYWRIGHT_BROWSERS_PATH}" && \
+    npx --yes playwright@${PLAYWRIGHT_VERSION} install --with-deps chromium chromium-headless-shell && \
+    test -d "${PLAYWRIGHT_BROWSERS_PATH}/chromium-${CHROMIUM_REVISION}" \
+      || (echo "FATAL: pinned chromium-${CHROMIUM_REVISION} not found under ${PLAYWRIGHT_BROWSERS_PATH}; check playwright-core@${PLAYWRIGHT_VERSION}'s browsers.json" >&2; exit 1) && \
+    chmod -R a+rX "${PLAYWRIGHT_BROWSERS_PATH}"
+
+WORKDIR /app
+
+# Local /app/node_modules holds deps our extensions import (zod). Node's
+# resolution from /app/extensions/<id>/index.ts walks up to /app/node_modules.
+RUN npm init -y >/dev/null && \
+    npm install --omit=dev zod@4
+
+# Bake our 10 extensions into the image. Paths inside the container:
+#   /app/extensions/<id>/{index.ts,openclaw.plugin.json,package.json,...}
+# `extensions/browser/` is vendored from upstream openclaw at the SHA
+# recorded in extensions/browser/UPSTREAM. See AUDIT_LOG.md for the per-
+# plugin audit verdict that gated this image.
+COPY extensions/ /app/extensions/
+
+# Strip any host-side node_modules that may have come along; we use /app/node_modules.
+RUN find /app/extensions -type d -name node_modules -prune -exec rm -rf {} + || true
+
+# The vendored `browser` plugin (extensions/browser/) declares runtime deps
+# beyond zod — typebox, express, ws, commander, @modelcontextprotocol/sdk. Node
+# resolves an extension's imports by walking up to /app/node_modules, and none
+# of these are transitive deps of the global openclaw, so without this the
+# plugin dies at load with "Cannot find module 'typebox'" (its first import).
+# jq reads ONLY `.dependencies` from browser's own package.json — single source
+# of truth, stays in lockstep with the vendor pin, and sidesteps the workspace:*
+# devDependency that would trip a bare `npm install`. playwright-core is excluded
+# (already installed globally above, version-pinned against the Chromium build).
+RUN npm install --omit=dev --prefix /app \
+      $(jq -r '.dependencies | to_entries[] | select(.key!="playwright-core") | "\(.key)@\(.value)"' \
+         /app/extensions/browser/package.json)
+
+# ---- CLAW-043: bake the gitignore read-shroud as a BUNDLED extension --------
+# openclaw gates `registerAgentToolResultMiddleware` (the seam that withholds
+# file CONTENTS *before the model reasons on them*, and the only seam that also
+# exposes the tool's path arg) to plugins with origin:"bundled". Our other
+# extensions are `--link`'d (origin:"config"), where that seam silently no-ops.
+# So this one — and only this one — must live inside openclaw's own
+# dist/extensions. The bundled slot loads `index.js` (not `.ts` via tsx like
+# /app/extensions), so we transpile TS -> ESM JS, preserving the ./src/*.js
+# import specifiers, and drop it in beside its manifest. typescript is installed
+# and removed in the SAME layer so the final image doesn't carry it. The
+# "cannot find node types" errors are expected without @types/node and do NOT
+# block emit (noEmitOnError:false), hence `|| true`; the `test -s` checks then
+# fail the build LOUD if any output is actually missing (a real syntax error
+# would block that file's emit). Coupling to watch on openclaw bumps: the
+# dist/extensions discovery path (see GITIGNORE_SHROUD_DESIGN.md build note).
+RUN OSB=/usr/local/lib/node_modules/openclaw/dist/extensions/operating-system-sandbox && \
+    npm install -g typescript@5.7 >/dev/null 2>&1 && \
+    cd /app/extensions/operating-system-sandbox && \
+    (tsc -p tsconfig.bundle.json || true) && \
+    mkdir -p "$OSB/src" && \
+    cp dist-bundle/index.js "$OSB/index.js" && \
+    cp dist-bundle/src/shroud-policy.js dist-bundle/src/shroud-transform.js "$OSB/src/" && \
+    cp openclaw.plugin.json "$OSB/openclaw.plugin.json" && \
+    printf '{"type":"module","name":"operating-system-sandbox","main":"index.js"}\n' > "$OSB/package.json" && \
+    test -s "$OSB/index.js" && test -s "$OSB/src/shroud-policy.js" && test -s "$OSB/src/shroud-transform.js" && \
+    grep -q registerAgentToolResultMiddleware "$OSB/index.js" && \
+    rm -rf dist-bundle && \
+    npm uninstall -g typescript >/dev/null 2>&1 && \
+    echo "[build] CLAW-043 os-sandbox bundled -> $OSB"
+
+# GitHub CLI (gh) so bots can manage their repos. Same release-tarball pattern
+# as gogcli: arch-aware, pinned, with a `--version` assertion so a bad pin fails
+# the build LOUD rather than at deploy. Placed late (after the heavy npm +
+# Playwright layers) so bumping it doesn't invalidate them. Bots authenticate
+# with a per-bot fine-grained PAT injected as GH_TOKEN (gh reads it from env);
+# actual git ops go through the guardrail shim installed just below.
+ARG TARGETARCH
+ARG GH_CLI_VERSION=2.96.0
+RUN case "${TARGETARCH:-amd64}" in \
+      amd64) GH_ARCH=amd64 ;; \
+      arm64) GH_ARCH=arm64 ;; \
+      *) echo "unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
+    esac && \
+    curl -fsSL "https://github.com/cli/cli/releases/download/v${GH_CLI_VERSION}/gh_${GH_CLI_VERSION}_linux_${GH_ARCH}.tar.gz" \
+      | tar -xz -C /tmp && \
+    install -D -m 0755 "/tmp/gh_${GH_CLI_VERSION}_linux_${GH_ARCH}/bin/gh" /usr/local/libexec/oasis-gh/gh && \
+    rm -rf "/tmp/gh_${GH_CLI_VERSION}_linux_${GH_ARCH}" && \
+    /usr/local/libexec/oasis-gh/gh --version
+
+# ---- git guardrail: shadow `git` with the rollback-safe wrapper -------------
+# Bakes the policy scripts read-only into the image (tamper-resistant — a bot
+# cannot edit its own guardrail). /usr/local/bin/git sits ahead of /usr/bin/git
+# on PATH and is the wrapper; it fails OPEN, passing everything except
+# force-push / ref-delete / out-of-scope pushes straight through to the real
+# /usr/bin/git. A global pre-push hook (wired via core.hooksPath in the
+# entrypoint) backstops direct /usr/bin/git calls. The credential helper serves
+# the per-bot GH_TOKEN for github.com https with no network call at boot (so an
+# egress-locked bot still starts). See scripts/git-policy/ + AUDIT_LOG.md.
+COPY scripts/git-policy/ /usr/local/lib/oasis-git-policy/
+RUN chmod +x /usr/local/lib/oasis-git-policy/git-guard.sh \
+             /usr/local/lib/oasis-git-policy/git-credential-oasis-gh.sh \
+             /usr/local/lib/oasis-git-policy/git-credential-oasis-gh-app \
+             /usr/local/lib/oasis-git-policy/git-credential-oasis-gh-file \
+             /usr/local/lib/oasis-git-policy/gh-oasis \
+             /usr/local/lib/oasis-git-policy/hooks/pre-push && \
+    ln -sf /usr/local/lib/oasis-git-policy/git-guard.sh                  /usr/local/bin/git && \
+    ln -sf /usr/local/lib/oasis-git-policy/git-credential-oasis-gh.sh    /usr/local/bin/git-credential-oasis-gh && \
+    ln -sf /usr/local/lib/oasis-git-policy/git-credential-oasis-gh-app   /usr/local/bin/git-credential-oasis-gh-app && \
+    ln -sf /usr/local/lib/oasis-git-policy/git-credential-oasis-gh-file  /usr/local/bin/git-credential-oasis-gh-file && \
+    ln -sf /usr/local/lib/oasis-git-policy/gh-oasis                      /usr/local/bin/gh && \
+    test "$(command -v gh)" = /usr/local/bin/gh && gh --version >/dev/null && \
+    test "$(command -v git)" = /usr/local/bin/git && \
+    /usr/local/bin/git --version >/dev/null && \
+    python3 -c "import ast; ast.parse(open('/usr/local/lib/oasis-git-policy/git-credential-oasis-gh-app').read())" && \
+    echo "[build] git guardrail + credential helpers installed (PAT: oasis-gh, App: oasis-gh-app, Mac minter: oasis-gh-file + gh wrapper)"
+
+# SSH exec sandbox client (CLAW-049 pilot, .swarm/SSH_SANDBOX_PILOT.md) and
+# ffmpeg for video understanding + agent frame extraction.
+# Unused until a bot sets OASIS_SANDBOX_SSH_SOCKET. A late layer, so the
+# cache above stays valid.
+RUN apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends openssh-client socat ffmpeg && \
+    rm -rf /var/lib/apt/lists/*
+COPY scripts/oasis-sbx-ssh /usr/local/bin/oasis-sbx-ssh
+# Inbound video understanding (tools.media.video CLI entry; ffmpeg above).
+COPY scripts/oasis-video-describe /usr/local/bin/oasis-video-describe
+
+# Entry script: generates openclaw.json with plugin.entries pointing at the
+# baked-in extensions, then execs `openclaw gateway`.
+COPY scripts/runtime-entrypoint.sh /usr/local/bin/runtime-entrypoint.sh
+COPY scripts/compile-role.py /usr/local/bin/compile-role.py
+# Persona boot check (runtime-entrypoint.sh runs it first; also
+# `docker exec <bot> persona-check status|pin`).
+COPY scripts/persona-check.mjs /usr/local/bin/persona-check
+RUN chmod +x /usr/local/bin/runtime-entrypoint.sh /usr/local/bin/compile-role.py /usr/local/bin/persona-check
+
+# Run as the unprivileged "node" user that's already present in the base image.
+RUN mkdir -p /home/node/.openclaw /home/node/.openclaw/workspace /home/node/.openclaw/logs && \
+    chown -R node:node /home/node/.openclaw /app
+
+USER node:node
+
+ENV HOME=/home/node \
+    NODE_PATH=/usr/local/lib/node_modules \
+    OPENCLAW_GATEWAY_BIND=lan \
+    OPENCLAW_GATEWAY_PORT=18789 \
+    OPENCLAW_DISABLE_BONJOUR=1 \
+    OPENCLAW_TZ=UTC \
+    # CLAW-082: /tmp is a 64 MB tmpfs. SQLite spills large transactions there
+    # and a big memory reindex exhausts it — "Memory index failed: database or
+    # disk is full" while the volume still has ~69 GB free. Declared HERE, not
+    # only exported in the entrypoint, because `docker exec` gets the
+    # container's env and NOT the entrypoint's exports: without this line a
+    # manual `docker exec ... openclaw memory index` still hits the tmpfs.
+    # The entrypoint creates the directory.
+    SQLITE_TMPDIR=/home/node/.openclaw/tmp
+
+EXPOSE 18789
+
+ENTRYPOINT ["/usr/local/bin/runtime-entrypoint.sh"]

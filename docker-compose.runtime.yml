@@ -1,0 +1,302 @@
+##
+## oasis-claw full-runtime compose
+##
+## Usage:
+##   docker compose -f docker-compose.runtime.yml up --build -d
+##   docker compose -f docker-compose.runtime.yml logs -f openclaw
+##
+## Network posture (LAN/IoT-safe by construction):
+##   - Inside the container, gateway binds 0.0.0.0:18789 so Docker's
+##     port-publish can reach it.
+##   - On the host, port is mapped to 127.0.0.1:18789 ONLY — other devices
+##     on the LAN cannot reach the gateway via your Mac's IP.
+##   - Bonjour/mDNS advertisement is disabled, so the gateway does not
+##     announce itself to LAN peers.
+##   - Auth token is mandatory; entrypoint mints one and writes it to
+##     ~/.openclaw/.gateway-token inside the container (volume-persisted).
+##   - Container drops all Linux capabilities and runs as non-root.
+##
+## To talk to the gateway from the Mac:
+##   curl -H "Authorization: Bearer $(docker compose -f docker-compose.runtime.yml \
+##           exec openclaw cat /home/node/.openclaw/.gateway-token)" \
+##        http://127.0.0.1:18789/healthz
+##
+
+## Multi-bot deployments live in the gitignored bots/ overlay. Layer it in like this:
+##   docker compose -f docker-compose.runtime.yml \
+##                  -f bots/docker-compose.bots.yml up -d
+## or use the convenience targets in bots/Makefile.
+
+services:
+  openclaw:
+    build:
+      context: .
+      dockerfile: Dockerfile.runtime
+    image: oasis-claw-runtime:local
+    container_name: oasis-claw-runtime
+    init: true
+    restart: unless-stopped
+
+    # Load credentials from .env directly. Using env_file (not `environment:`
+    # with ${VAR:-} interpolation) is deliberate — interpolation lets the
+    # invoking shell shadow .env values with empty exports, which silently
+    # broke Anthropic auth once before. env_file always wins.
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      # Non-secret runtime knobs only. Secrets come from env_file above.
+      OPENCLAW_GATEWAY_BIND: lan
+      OPENCLAW_GATEWAY_PORT: "18789"
+      OPENCLAW_DISABLE_BONJOUR: "1"
+      TZ: ${OPENCLAW_TZ:-UTC}
+      # Ollama: forward host override when set in .env (default points at host).
+      # Unset means openclaw uses its own default (localhost:11434 inside container,
+      # which is wrong — that's why extra_hosts + this forwarding are both needed).
+      OLLAMA_HOST: ${OLLAMA_HOST:-http://host.docker.internal:11434}
+      # gog (Gmail/Calendar/Drive CLI) writes its OAuth keyring to
+      # $XDG_CONFIG_HOME/gogcli/ and the manual-flow auth state to
+      # $XDG_STATE_HOME/gogcli/. The container is read_only:true, so default
+      # ~/.config and ~/.local/state are unwritable — point both at the
+      # persistent .openclaw volume.
+      XDG_CONFIG_HOME: /home/node/.openclaw/config
+      XDG_STATE_HOME: /home/node/.openclaw/state
+      # ── Reviewer loop guard (CLAW-089) ──
+      # Built after the 2026-08-13 one bot incident: 14 minutes of near-identical
+      # repeated replies with no automatic stop. It shipped OFF by default and
+      # was never switched on for any bot.
+      #
+      # The guard now matches NEAR-identical replies (Dice similarity over word
+      # bigrams, after masking timestamps/ids/counters), so a reworded or
+      # renumbered repeat counts. Before 2026-09-01 it compared an exact hash and
+      # would very likely never have caught the incident it was built for.
+      #
+      # ENFORCE since 2026-09-01 (the operator: "Enforce now. I'll tell you what
+      # happens."). Promoted straight from shadow without waiting for audit rows
+      # — shadow had recorded none on any bot, because the guard needs 3
+      # near-identical replies inside ONE session and the fleet had only been on
+      # the new build for minutes. The operator accepted that trade deliberately.
+      #
+      # When it fires it ends the turn; it never blocks a tool call and never
+      # touches mail. To roll back, set this to `shadow` HERE AND in
+      # bots/docker-compose.bots.yml, then recreate the bots.
+      #
+      # TRANSIENT_THRESHOLD is the rope for a retry that names a network or model
+      # failure: repeating yourself through a flapping link is correct behaviour,
+      # so those streaks are measured against 6 instead of 3. It is more rope and
+      # NOT an exemption — past it the cause is a blocker to report, not retry.
+      # Override any of these per bot in that bot's own compose overlay.
+      OASIS_REVIEWER_LOOP_GUARD: ${OASIS_REVIEWER_LOOP_GUARD:-enforce}
+      OASIS_REVIEWER_LOOP_GUARD_THRESHOLD: ${OASIS_REVIEWER_LOOP_GUARD_THRESHOLD:-3}
+      OASIS_REVIEWER_LOOP_GUARD_TRANSIENT_THRESHOLD: ${OASIS_REVIEWER_LOOP_GUARD_TRANSIENT_THRESHOLD:-6}
+      # ── Decision-model shadow (CLAW-118) ──
+      # off | shadow. There is no enforce value: the decider's answers are
+      # logged as phase:"decider_shadow" rows and never change a verdict.
+      # Repeated in bots/docker-compose.bots.yml for the same reason as the
+      # loop guard above.
+      OASIS_REVIEWER_DECIDER: ${OASIS_REVIEWER_DECIDER:-shadow}
+      # CLAW-119: in a run peer mail woke up, an escalation needs a peer grant
+      # (else fail closed). Off by default; fleets that run the autoreviewer bot set 1.
+      OASIS_REVIEWER_MAIL_WAKE_REQUIRES_GRANT: ${OASIS_REVIEWER_MAIL_WAKE_REQUIRES_GRANT:-0}
+      OASIS_REVIEWER_DECIDER_URL: ${OASIS_REVIEWER_DECIDER_URL:-http://oasis-decider:8790}
+      # Shadow calls are never awaited, so a long timeout costs nothing. 8 s
+      # (the old code default) timed out 39 of 78 calls in a multi-bot burst.
+      # The code default is now the same 60 s (decider.ts,
+      # DEFAULT_DECIDER_TIMEOUT_MS), and each decider row records decTimeoutMs.
+      # The l1_only scoring (reviewer.ts) needs no setting here: it is on by
+      # default, and OASIS_REVIEWER_DECIDER_L1_ONLY=off stops it.
+      OASIS_REVIEWER_DECIDER_TIMEOUT_MS: ${OASIS_REVIEWER_DECIDER_TIMEOUT_MS:-60000}
+
+    # Host-side mapping is loopback-only. Other devices on your Wi-Fi
+    # cannot reach this port through your Mac's LAN IP.
+    ports:
+      - "127.0.0.1:18789:18789"
+
+    volumes:
+      # Persist config, plugin state, transcripts, attack logs, and the
+      # gateway token across restarts.
+      - oasis_openclaw_home:/home/node/.openclaw
+
+    # Ollama: resolves to the Mac's host IP from inside the container.
+    # Required when OPENCLAW_DEFAULT_MODEL=ollama/<model> and Ollama runs on
+    # the host. No-op when Ollama isn't used.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    # Hardening
+    user: "node"
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+      - /home/node/.cache:size=32m,mode=0700
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    # Block raw sockets / kernel keyring abuse / namespace tricks. The
+    # gateway only needs IP networking on its loopback-published port.
+    networks:
+      - oasis_runtime
+      - oasis_decider   # CLAW-118: reach oasis-decider; internal, no route out
+
+    healthcheck:
+      # Authenticated healthz to avoid false-positives if auth is misconfigured.
+      test:
+        - "CMD-SHELL"
+        - >
+          token=$$(cat /home/node/.openclaw/.gateway-token 2>/dev/null);
+          curl -fsS -H "Authorization: Bearer $$token"
+          http://127.0.0.1:18789/healthz >/dev/null
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+    # The oasis-voice sidecar starts in parallel; openclaw doesn't need it
+    # to be UP at boot (the plugin tolerates a not-yet-listening endpoint
+    # and retries), but adding a `depends_on` makes `docker compose up`
+    # bring them together by default.
+    depends_on:
+      - oasis-voice
+      - oasis-semantics
+
+  # ─── oasis-semantics sidecar ─────────────────────────────────────────
+  # Multimodal embedding service. Text (sentence-transformers: bge-small,
+  # bge-m3, MiniLM, nomic) + image+text shared-space (CLIP, SigLIP).
+  # Consumed by the extensions/oasis-semantics openclaw plugin which
+  # registers as a MemoryEmbeddingProviderAdapter for memory-core.
+  #
+  # Build (one-time, after changes to vendor/oasis-semantics):
+  #   (cd vendor/oasis-semantics && docker build -f docker/Dockerfile.cpu -t oasis-semantics:cpu .)
+  #
+  # Weights are downloaded into a named volume on first request (lazy
+  # load). bge-small-en-v1.5 is ~130MB; CLIP ViT-B/32 ~600MB. Rebuilding
+  # the image doesn't wipe them.
+  oasis-semantics:
+    image: oasis-semantics:cpu
+    container_name: oasis-semantics
+    init: true
+    restart: unless-stopped
+    environment:
+      OASIS_SEMANTICS_DEFAULT_TEXT_MODEL: default
+      OASIS_SEMANTICS_DEFAULT_MM_MODEL: clip-lite
+      OASIS_SEMANTICS_SKIP_WARMUP: "1"
+      HF_HOME: /srv/weights/huggingface
+    # CLAW-094: scripts/build-semantic-index.py runs on the HOST (the same
+    # trusted context compile-role.py already requires, since it reads every
+    # bot's role.yaml and the raw corpus off the host filesystem) and calls
+    # this sidecar's /api/embed directly. "oasis-semantics:8732" is a
+    # Docker-internal DNS name — it does not resolve from the host's own
+    # network namespace. Loopback-only, matching every other published port in
+    # this file (18789, 18790-18796) — never 0.0.0.0, this stays unreachable
+    # from outside the host.
+    ports:
+      - "127.0.0.1:8732:8732"
+    volumes:
+      - oasis_semantics_weights:/srv/weights
+    networks:
+      - oasis_runtime
+    user: "1000:1000"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - "python3 -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8732/healthz')\""
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ─── oasis-voice sidecar (CLAW-021) ──────────────────────────────────
+  # Speech-in / speech-out service. Runs the same image the cloud-MVP
+  # path (CLAW-013) will deploy to ECS — keeping it as a sibling container
+  # NOW means the lift-to-cloud step later is a `docker compose` profile
+  # change, not a refactor.
+  #
+  # The openclaw container talks to this service by docker DNS name
+  # ("oasis-voice") on the oasis_runtime bridge network. No host port
+  # mapping — the sidecar is not reachable from the Mac. That's
+  # intentional: oasis-voice has no auth (the plugin trusts the network
+  # boundary), so we keep it inside the network.
+  #
+  # Build (one-time, after bumping the vendor/oasis-voice submodule pin):
+  #   (cd vendor/oasis-voice && docker build -f docker/Dockerfile.cpu -t oasis-voice:cpu .)
+  #
+  # Weights are downloaded into a named volume on first boot. They take
+  # ~50MB (Piper voice + Moonshine ONNX); rebuilding the image doesn't
+  # wipe them.
+  oasis-voice:
+    image: oasis-voice:cpu
+    container_name: oasis-voice
+    init: true
+    restart: unless-stopped
+    environment:
+      # Lite tier = Piper TTS + Moonshine STT on CPU. The whole point of
+      # CLAW-021 MVP is "in-container locally, no oasis-cloud dep" — see
+      # AUDIT_LOG.md change-log row for the gate decision.
+      VOICE_STT_TIER: lite
+      VOICE_TTS_TIER: lite
+      # Skip the warmup blocking-load on boot — backends lazy-load on
+      # first request. Trades a slow first-call (~200-500ms extra) for a
+      # fast container start (otherwise we'd need a longer healthcheck
+      # grace period).
+      VOICE_SKIP_WARMUP: "1"
+      # Default Piper voice — UK Aru (medium), RP accent.
+      # Overrides the upstream-hardcoded en_US-lessac-high default in piper.py.
+      VOICE_PIPER_DEFAULT_VOICE: en_GB-aru-medium
+      # Weights live on the volume below. Both XDG_CACHE_HOME (used by
+      # huggingface/onnxruntime caches) and XDG_DATA_HOME (used by piper.py
+      # and the download_weights script to resolve voice files) point to it.
+      # Originally only XDG_CACHE_HOME was set — that worked while warmup was
+      # being skipped entirely, but once lazy-load actually fired, piper
+      # couldn't find its voice file. Both vars now to keep the search paths
+      # consistent.
+      XDG_CACHE_HOME: /srv/weights
+      XDG_DATA_HOME: /srv/weights
+    volumes:
+      # Persist Piper voices + Moonshine ONNX across image rebuilds.
+      - oasis_voice_weights:/srv/weights
+    networks:
+      - oasis_runtime
+    # No `ports:` block on purpose — sidecar is reachable only from the
+    # oasis_runtime bridge network, i.e. only from the openclaw container.
+    user: "1000:1000"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      # /healthz is a cheap liveness probe — no model invocation required.
+      # oasis-voice image has no curl; use Python stdlib urllib instead.
+      test:
+        - "CMD-SHELL"
+        - "python3 -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8731/healthz')\""
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      # Lite-tier first request can take a moment to warm Piper +
+      # Moonshine if VOICE_SKIP_WARMUP=1 ate the boot warmup.
+      start_period: 30s
+
+networks:
+  oasis_runtime:
+    # Default bridge driver. No driver_opts to expose externally — the
+    # only ingress is the explicit ports: mapping above.
+    driver: bridge
+  # CLAW-118: internal, no internet. Members: oasis-decider (declared in
+  # sandbox/docker-compose.sandbox-runtime.yml), the main bot, and the non-sandboxed
+  # bots/ services. Declared here so the main bot's own two-file stack knows it.
+  oasis_decider:
+    driver: bridge
+    internal: true
+
+volumes:
+  oasis_openclaw_home:
+    name: oasis_openclaw_home
+  oasis_voice_weights:
+    name: oasis_voice_weights
+  oasis_semantics_weights:
+    name: oasis_semantics_weights

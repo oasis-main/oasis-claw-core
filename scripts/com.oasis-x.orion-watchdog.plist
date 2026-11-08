@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  ██ RETIRED 2026-07-26 (CLAW-073) — NOT LOADED. This plist and its script were
+  ██ removed from ~/Library/LaunchAgents + ~/Library/Application Support. The
+  ██ "polling stalls" it chased were macOS Maintenance Sleep, not an openclaw
+  ██ bug; the watchdog caused spurious docker restarts. See orion-watchdog.sh
+  ██ header + queue.md CLAW-073. Kept in-repo for reference only.
+
+  orion-watchdog — recovers the Telegram polling channel after a silent death.
+
+  Source of truth for this plist is the repo; `make watchdog-install` deploys it.
+
+  ProgramArguments deliberately points OUTSIDE the repo. macOS TCC blocks launchd
+  agents from reading ~/Documents, so an agent pointed at
+  ~/Documents/Runes/oasis-x/oasis-claw/scripts/orion-watchdog.sh fails with
+  "Operation not permitted" (exit 126) on EVERY fire — silently, since a
+  watchdog's healthy state is also silence. That is exactly what happened: this
+  agent sat dead for as long as it was installed and Orion had no watchdog at all.
+
+  The script itself needs only `docker` and ~/Library/Logs (verified — it reads
+  nothing under ~/Documents), so deploying a copy to ~/Library/Application Support
+  is sufficient. No Full Disk Access grant, and no container holding a
+  root-equivalent docker socket just to run `docker restart`.
+
+  Re-run `make watchdog-install` after editing scripts/orion-watchdog.sh — the
+  deployed copy does not track the repo automatically.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.oasis-x.orion-watchdog</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__HOME__/Library/Application Support/oasis-x/orion-watchdog.sh</string>
+    </array>
+
+    <!-- 90s: the stall is fleet-wide (~9-10 events/bot/day); the script now watches
+         ALL bot containers, so recover them within ~90s instead of the 5-min cadence
+         (and far below openclaw's ~30-min internal stall threshold). -->
+    <key>StartInterval</key>
+    <integer>90</integer>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+        <key>HOME</key>
+        <string>__HOME__</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/Library/Logs/orion-watchdog.stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>__HOME__/Library/Logs/orion-watchdog.stderr.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

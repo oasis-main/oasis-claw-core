@@ -76,6 +76,12 @@ importers:
         specifier: ^3.0.0
         version: 3.2.4(@types/node@25.6.2)(jiti@2.7.0)(tsx@4.21.0)(yaml@2.9.0)
 
+  extensions/oasis-brave-search:
+    devDependencies:
+      openclaw:
+        specifier: workspace:*
+        version: link:../../packages/openclaw-stub
+
   extensions/oasis-find:
     dependencies:
       zod:
@@ -131,6 +137,19 @@ importers:
         version: 2026.6.11
       vitest:
         specifier: ^3.2.4
+        version: 3.2.4(@types/node@25.6.2)(jiti@2.7.0)(tsx@4.21.0)(yaml@2.9.0)
+
+  extensions/oasis-voice-control:
+    dependencies:
+      zod:
+        specifier: ^4.4.1
+        version: 4.4.3
+    devDependencies:
+      openclaw:
+        specifier: workspace:*
+        version: link:../../packages/openclaw-stub
+      vitest:
+        specifier: ^3.0.0
         version: 3.2.4(@types/node@25.6.2)(jiti@2.7.0)(tsx@4.21.0)(yaml@2.9.0)
 
   extensions/operating-system-sandbox:
